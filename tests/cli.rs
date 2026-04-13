@@ -1,0 +1,66 @@
+use std::fs;
+use std::path::PathBuf;
+use std::process::Command;
+
+fn temp_dir(name: &str) -> PathBuf {
+    let dir = std::env::temp_dir().join(format!(
+        "codex-recall-cli-test-{}-{}",
+        std::process::id(),
+        name
+    ));
+    let _ = fs::remove_dir_all(&dir);
+    fs::create_dir_all(&dir).unwrap();
+    dir
+}
+
+fn write_sample_session(root: &std::path::Path) {
+    let session_dir = root.join("2026/04/13");
+    fs::create_dir_all(&session_dir).unwrap();
+    fs::write(
+        session_dir.join("rollout-2026-04-13T01-00-00-session-1.jsonl"),
+        r#"{"timestamp":"2026-04-13T01:00:00Z","type":"session_meta","payload":{"id":"session-1","timestamp":"2026-04-13T01:00:00Z","cwd":"/Users/me/project","cli_version":"0.1.0"}}
+{"timestamp":"2026-04-13T01:00:01Z","type":"event_msg","payload":{"type":"user_message","message":"Debug RevenueCat Stripe webhook"}}
+{"timestamp":"2026-04-13T01:00:02Z","type":"event_msg","payload":{"type":"agent_message","message":"The production webhook secret was missing."}}
+"#,
+    )
+    .unwrap();
+}
+
+#[test]
+fn index_then_search_outputs_ranked_receipts() {
+    let temp = temp_dir("index-search");
+    let source = temp.join("sessions");
+    let db = temp.join("index.sqlite");
+    write_sample_session(&source);
+
+    let index = Command::new(env!("CARGO_BIN_EXE_codex-recall"))
+        .args(["index", "--db"])
+        .arg(&db)
+        .args(["--source"])
+        .arg(&source)
+        .output()
+        .unwrap();
+    assert!(
+        index.status.success(),
+        "index failed: {}",
+        String::from_utf8_lossy(&index.stderr)
+    );
+    assert!(String::from_utf8_lossy(&index.stdout).contains("indexed 1 sessions"));
+
+    let search = Command::new(env!("CARGO_BIN_EXE_codex-recall"))
+        .args(["search", "webhook secret", "--db"])
+        .arg(&db)
+        .output()
+        .unwrap();
+    assert!(
+        search.status.success(),
+        "search failed: {}",
+        String::from_utf8_lossy(&search.stderr)
+    );
+
+    let stdout = String::from_utf8_lossy(&search.stdout);
+    assert!(stdout.contains("session-1"));
+    assert!(stdout.contains("/Users/me/project"));
+    assert!(stdout.contains(":3"));
+    assert!(stdout.contains("production webhook secret"));
+}
