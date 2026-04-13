@@ -26,6 +26,17 @@ pub struct SearchResult {
     pub source_timestamp: Option<String>,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SessionEvent {
+    pub session_id: String,
+    pub kind: EventKind,
+    pub text: String,
+    pub cwd: String,
+    pub source_file_path: PathBuf,
+    pub source_line_number: usize,
+    pub source_timestamp: Option<String>,
+}
+
 impl Store {
     pub fn open(path: impl AsRef<Path>) -> Result<Self> {
         let path = path.as_ref();
@@ -123,6 +134,53 @@ impl Store {
                 source_file_path: PathBuf::from(source_file_path),
                 source_line_number: source_line_number as usize,
                 source_timestamp: row.get(8)?,
+            })
+        })?;
+
+        rows.collect::<std::result::Result<Vec<_>, _>>()
+            .map_err(Into::into)
+    }
+
+    pub fn session_events(&self, session_id: &str, limit: usize) -> Result<Vec<SessionEvent>> {
+        let limit = limit.max(1).min(500);
+        let mut statement = self.conn.prepare(
+            r#"
+            SELECT
+                events.session_id,
+                events.kind,
+                events.text,
+                sessions.cwd,
+                events.source_file_path,
+                events.source_line_number,
+                events.source_timestamp
+            FROM events
+            JOIN sessions ON sessions.session_id = events.session_id
+            WHERE events.session_id = ?
+            ORDER BY events.source_line_number ASC
+            LIMIT ?
+            "#,
+        )?;
+
+        let rows = statement.query_map(params![session_id, limit as i64], |row| {
+            let kind_text: String = row.get(1)?;
+            let kind = EventKind::from_str(&kind_text).ok_or_else(|| {
+                rusqlite::Error::InvalidColumnType(
+                    1,
+                    "kind".to_owned(),
+                    rusqlite::types::Type::Text,
+                )
+            })?;
+            let source_file_path: String = row.get(4)?;
+            let source_line_number: i64 = row.get(5)?;
+
+            Ok(SessionEvent {
+                session_id: row.get(0)?,
+                kind,
+                text: row.get(2)?,
+                cwd: row.get(3)?,
+                source_file_path: PathBuf::from(source_file_path),
+                source_line_number: source_line_number as usize,
+                source_timestamp: row.get(6)?,
             })
         })?;
 

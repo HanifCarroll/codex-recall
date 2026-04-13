@@ -16,6 +16,7 @@ pub fn run(args: impl IntoIterator<Item = String>) -> Result<()> {
     match command.as_str() {
         "index" => run_index(args.collect()),
         "search" => run_search(args.collect()),
+        "show" => run_show(args.collect()),
         "stats" => run_stats(args.collect()),
         "help" | "--help" | "-h" => {
             print_help();
@@ -23,6 +24,58 @@ pub fn run(args: impl IntoIterator<Item = String>) -> Result<()> {
         }
         _ => bail!("unknown command `{command}`"),
     }
+}
+
+fn run_show(args: Vec<String>) -> Result<()> {
+    if args.is_empty() {
+        bail!("show requires a session id");
+    }
+
+    let session_id = args[0].clone();
+    let mut db_path = default_db_path()?;
+    let mut limit = 80usize;
+    let mut index = 1;
+
+    while index < args.len() {
+        match args[index].as_str() {
+            "--db" => {
+                index += 1;
+                db_path = required_path(&args, index, "--db")?;
+            }
+            "--limit" => {
+                index += 1;
+                let raw = args
+                    .get(index)
+                    .ok_or_else(|| anyhow!("--limit requires a value"))?;
+                limit = raw
+                    .parse()
+                    .with_context(|| format!("parse --limit value `{raw}`"))?;
+            }
+            flag => bail!("unknown show flag `{flag}`"),
+        }
+        index += 1;
+    }
+
+    let store = Store::open(&db_path)?;
+    let events = store.session_events(&session_id, limit)?;
+    if events.is_empty() {
+        println!("no indexed events for {session_id}");
+        return Ok(());
+    }
+
+    println!("{session_id}");
+    println!("{}", events[0].cwd);
+    for event in events {
+        println!(
+            "\n{}  {}:{}",
+            event.kind.as_str(),
+            event.source_file_path.display(),
+            event.source_line_number
+        );
+        println!("{}", preview(&event.text, 900));
+    }
+
+    Ok(())
 }
 
 fn run_index(args: Vec<String>) -> Result<()> {
@@ -210,7 +263,7 @@ fn print_search_json(query: &str, results: &[SearchResult]) -> Result<()> {
 
 fn print_help() {
     println!(
-        "codex-recall\n\nCommands:\n  index [--db PATH] [--source PATH ...]\n  search QUERY [--db PATH] [--limit N] [--json]\n  stats [--db PATH]"
+        "codex-recall\n\nCommands:\n  index [--db PATH] [--source PATH ...]\n  search QUERY [--db PATH] [--limit N] [--json]\n  show SESSION_ID [--db PATH] [--limit N]\n  stats [--db PATH]"
     );
 }
 

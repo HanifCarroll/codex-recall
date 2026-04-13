@@ -107,3 +107,39 @@ fn search_json_outputs_machine_readable_receipts() {
         .unwrap()
         .contains("production webhook secret"));
 }
+
+#[test]
+fn show_prints_session_events_with_line_receipts() {
+    let temp = temp_dir("show");
+    let source = temp.join("sessions");
+    let db = temp.join("index.sqlite");
+    write_sample_session(&source);
+
+    let index = Command::new(env!("CARGO_BIN_EXE_codex-recall"))
+        .args(["index", "--db"])
+        .arg(&db)
+        .args(["--source"])
+        .arg(&source)
+        .output()
+        .unwrap();
+    assert!(index.status.success());
+
+    let show = Command::new(env!("CARGO_BIN_EXE_codex-recall"))
+        .args(["show", "session-1", "--db"])
+        .arg(&db)
+        .output()
+        .unwrap();
+    assert!(
+        show.status.success(),
+        "show failed: {}",
+        String::from_utf8_lossy(&show.stderr)
+    );
+
+    let stdout = String::from_utf8_lossy(&show.stdout);
+    assert!(stdout.contains("session-1"));
+    assert!(stdout.contains("user_message"));
+    assert!(stdout.contains(":2"));
+    assert!(stdout.contains("Debug RevenueCat Stripe webhook"));
+    assert!(stdout.contains("assistant_message"));
+    assert!(stdout.contains(":3"));
+}
