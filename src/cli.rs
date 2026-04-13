@@ -150,7 +150,12 @@ fn run_search(args: Vec<String>) -> Result<()> {
     }
 
     let store = Store::open(&db_path)?;
-    let results = store.search(&query, limit)?;
+    let search_limit = if json_output {
+        limit
+    } else {
+        limit.saturating_mul(5)
+    };
+    let results = store.search(&query, search_limit)?;
     if json_output {
         print_search_json(&query, &results)?;
         return Ok(());
@@ -161,21 +166,7 @@ fn run_search(args: Vec<String>) -> Result<()> {
         return Ok(());
     }
 
-    for (index, result) in results.iter().enumerate() {
-        println!(
-            "{}. {}  {}  {}",
-            index + 1,
-            result.session_id,
-            result.kind.as_str(),
-            result.cwd
-        );
-        println!(
-            "   {}:{}",
-            result.source_file_path.display(),
-            result.source_line_number
-        );
-        println!("   {}", compact_whitespace(&result.snippet));
-    }
+    print_grouped_search_results(&results, limit);
 
     Ok(())
 }
@@ -211,6 +202,39 @@ fn required_path(args: &[String], index: usize, flag: &str) -> Result<PathBuf> {
 
 fn compact_whitespace(value: &str) -> String {
     value.split_whitespace().collect::<Vec<_>>().join(" ")
+}
+
+fn print_grouped_search_results(results: &[SearchResult], limit: usize) {
+    let mut session_order = Vec::<&str>::new();
+    for result in results {
+        if !session_order
+            .iter()
+            .any(|session_id| *session_id == result.session_id)
+        {
+            session_order.push(&result.session_id);
+        }
+        if session_order.len() == limit {
+            break;
+        }
+    }
+
+    for (index, session_id) in session_order.iter().enumerate() {
+        let session_results = results
+            .iter()
+            .filter(|result| &result.session_id == session_id)
+            .collect::<Vec<_>>();
+        let first = session_results[0];
+        println!("{}. {}  {}", index + 1, first.session_id, first.cwd);
+        for result in session_results.into_iter().take(3) {
+            println!(
+                "   - {}  {}:{}",
+                result.kind.as_str(),
+                result.source_file_path.display(),
+                result.source_line_number
+            );
+            println!("     {}", compact_whitespace(&result.snippet));
+        }
+    }
 }
 
 fn preview(value: &str, limit: usize) -> String {
