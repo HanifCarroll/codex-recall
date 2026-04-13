@@ -52,7 +52,7 @@ codex-recall show <session-key> --limit 20
 - Interprets `today` and `yesterday` using the local day boundary, then compares against UTC transcript timestamps.
 - Boosts results from the current git repo by default. Use `--repo` to filter to a repo, or `--all-repos` to disable the current-repo boost.
 - Tracks file size and mtime so repeat indexing skips unchanged sessions.
-- Reports progress to stderr every 100 scanned files during indexing.
+- Reports indexing progress to stderr with discovered file totals, bytes processed, elapsed time, ETA, current file, and skipped-file reason counts.
 - Groups text search output by session, with the best receipts under each session.
 - Ranks sessions by current-repo match, hit count, event kind, FTS rank, and recency.
 - Reports source-file counts and duplicate source-file counts in `stats`.
@@ -78,6 +78,6 @@ codex-recall rebuild
 
 ## Local Verification
 
-The full archive on this machine parsed 1,079 session files in about 59 seconds on the first run.
+The April 13, 2026 full historical rebuild on this machine parsed 1,090 session files and 485,037 events in about 28 minutes. Large live archives can have long gaps between files, so use stderr progress for current-file and ETA visibility.
 
-A repeat run skipped 1,077 unchanged files and completed in about 0.55 seconds.
+A repeat index run skips unchanged files and should finish much faster.

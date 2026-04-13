@@ -8,10 +8,17 @@ use std::time::UNIX_EPOCH;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct IndexReport {
+    pub files_total: usize,
     pub files_seen: usize,
     pub files_skipped: usize,
+    pub skipped_unchanged: usize,
+    pub skipped_missing: usize,
+    pub skipped_non_session: usize,
     pub sessions_indexed: usize,
     pub events_indexed: usize,
+    pub bytes_total: u64,
+    pub bytes_seen: u64,
+    pub current_file: Option<PathBuf>,
 }
 
 pub fn index_sources(store: &Store, sources: &[PathBuf]) -> Result<IndexReport> {
@@ -26,71 +33,121 @@ pub fn index_sources_with_progress<F>(
 where
     F: FnMut(&IndexReport),
 {
+    let mut files = Vec::new();
+    for source in sources {
+        files.extend(jsonl_files(source)?);
+    }
+    files.sort();
+
     let mut report = IndexReport {
+        files_total: files.len(),
         files_seen: 0,
         files_skipped: 0,
+        skipped_unchanged: 0,
+        skipped_missing: 0,
+        skipped_non_session: 0,
         sessions_indexed: 0,
         events_indexed: 0,
+        bytes_total: total_known_bytes(&files),
+        bytes_seen: 0,
+        current_file: None,
     };
 
-    for source in sources {
-        for path in jsonl_files(source)? {
+    on_progress(&report);
+
+    for path in files {
+        report.current_file = Some(path.clone());
+        on_progress(&report);
+
+        let file_state = match FileState::from_path(&path) {
+            Ok(file_state) => file_state,
+            Err(error) if is_not_found_error(&error) => {
+                report.files_seen += 1;
+                report.files_skipped += 1;
+                report.skipped_missing += 1;
+                if should_report_after_file(&report) {
+                    on_progress(&report);
+                }
+                continue;
+            }
+            Err(error) => return Err(error),
+        };
+        report.bytes_seen = report
+            .bytes_seen
+            .saturating_add(file_state.source_file_size as u64);
+
+        if store.is_source_current(
+            &path,
+            file_state.source_file_mtime_ns,
+            file_state.source_file_size,
+        )? {
             report.files_seen += 1;
-            if report.files_seen % 100 == 0 {
+            report.files_skipped += 1;
+            report.skipped_unchanged += 1;
+            if should_report_after_file(&report) {
                 on_progress(&report);
             }
-            let file_state = match FileState::from_path(&path) {
-                Ok(file_state) => file_state,
-                Err(error) if is_not_found_error(&error) => {
-                    report.files_skipped += 1;
-                    continue;
+            continue;
+        }
+
+        let parsed = match parse_session_file(&path) {
+            Ok(parsed) => parsed,
+            Err(error) if is_not_found_error(&error) => {
+                report.files_seen += 1;
+                report.files_skipped += 1;
+                report.skipped_missing += 1;
+                if should_report_after_file(&report) {
+                    on_progress(&report);
                 }
-                Err(error) => return Err(error),
-            };
-            if store.is_source_current(
+                continue;
+            }
+            Err(error) => return Err(error),
+        };
+
+        if let Some(parsed) = parsed {
+            let session_key =
+                build_session_key(&parsed.session.id, &parsed.session.source_file_path);
+            report.events_indexed += parsed.events.len();
+            store.index_session(&parsed)?;
+            store.mark_source_indexed(
                 &path,
                 file_state.source_file_mtime_ns,
                 file_state.source_file_size,
-            )? {
-                report.files_skipped += 1;
-                continue;
-            }
+                Some(&parsed.session.id),
+                Some(&session_key),
+            )?;
+            report.sessions_indexed += 1;
+        } else {
+            store.mark_source_indexed(
+                &path,
+                file_state.source_file_mtime_ns,
+                file_state.source_file_size,
+                None,
+                None,
+            )?;
+            report.files_skipped += 1;
+            report.skipped_non_session += 1;
+        }
 
-            let parsed = match parse_session_file(&path) {
-                Ok(parsed) => parsed,
-                Err(error) if is_not_found_error(&error) => {
-                    report.files_skipped += 1;
-                    continue;
-                }
-                Err(error) => return Err(error),
-            };
-
-            if let Some(parsed) = parsed {
-                let session_key =
-                    build_session_key(&parsed.session.id, &parsed.session.source_file_path);
-                report.events_indexed += parsed.events.len();
-                store.index_session(&parsed)?;
-                store.mark_source_indexed(
-                    &path,
-                    file_state.source_file_mtime_ns,
-                    file_state.source_file_size,
-                    Some(&parsed.session.id),
-                    Some(&session_key),
-                )?;
-                report.sessions_indexed += 1;
-            } else {
-                store.mark_source_indexed(
-                    &path,
-                    file_state.source_file_mtime_ns,
-                    file_state.source_file_size,
-                    None,
-                    None,
-                )?;
-            }
+        report.files_seen += 1;
+        if should_report_after_file(&report) {
+            on_progress(&report);
         }
     }
 
     Ok(report)
+}
+
+fn should_report_after_file(report: &IndexReport) -> bool {
+    report.files_seen == 1 || report.files_seen % 25 == 0 || report.files_seen == report.files_total
+}
+
+fn total_known_bytes(files: &[PathBuf]) -> u64 {
+    files
+        .iter()
+        .filter_map(|path| fs::metadata(path).ok())
+        .map(|metadata| metadata.len())
+        .sum()
 }
 
 struct FileState {
@@ -157,17 +214,26 @@ mod tests {
         let root = temp_root("incremental");
         let source = root.join("sessions");
         std::fs::create_dir_all(&source).unwrap();
-        write_session(&source.join("session.jsonl"), "First message");
+        let session_file = source.join("session.jsonl");
+        write_session(&session_file, "First message");
         let store = Store::open(root.join("index.sqlite")).unwrap();
 
         let first = index_sources(&store, &[source.clone()]).unwrap();
         let second = index_sources(&store, &[source]).unwrap();
 
         assert_eq!(first.files_seen, 1);
+        assert_eq!(first.files_total, 1);
+        assert!(first.bytes_total > 0);
+        assert_eq!(first.bytes_seen, first.bytes_total);
+        assert_eq!(first.current_file, Some(session_file));
         assert_eq!(first.files_skipped, 0);
         assert_eq!(first.sessions_indexed, 1);
         assert_eq!(second.files_seen, 1);
+        assert_eq!(second.files_total, 1);
         assert_eq!(second.files_skipped, 1);
+        assert_eq!(second.skipped_unchanged, 1);
+        assert_eq!(second.skipped_missing, 0);
+        assert_eq!(second.skipped_non_session, 0);
         assert_eq!(second.sessions_indexed, 0);
     }
 
@@ -188,7 +254,7 @@ mod tests {
 
         let mut removed = false;
         let report = index_sources_with_progress(&store, &[source], |report| {
-            if report.files_seen == 100 && !removed {
+            if report.files_seen == 0 && !removed {
                 std::fs::remove_file(&disappearing).unwrap();
                 removed = true;
             }
@@ -196,8 +262,30 @@ mod tests {
         .unwrap();
 
         assert_eq!(report.files_seen, 100);
+        assert_eq!(report.files_total, 100);
         assert_eq!(report.files_skipped, 1);
+        assert_eq!(report.skipped_missing, 1);
         assert_eq!(report.sessions_indexed, 99);
+    }
+
+    #[test]
+    fn reports_current_file_before_processing() {
+        let root = temp_root("current-before-processing");
+        let source = root.join("sessions");
+        std::fs::create_dir_all(&source).unwrap();
+        let session_file = source.join("session.jsonl");
+        write_session(&session_file, "Current file");
+        let store = Store::open(root.join("index.sqlite")).unwrap();
+
+        let mut saw_current_before_index = false;
+        index_sources_with_progress(&store, &[source], |report| {
+            if report.current_file.as_ref() == Some(&session_file) && report.sessions_indexed == 0 {
+                saw_current_before_index = true;
+            }
+        })
+        .unwrap();
+
+        assert!(saw_current_before_index);
     }
 }
 

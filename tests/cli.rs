@@ -536,5 +536,9 @@ fn index_reports_progress_for_larger_sources() {
     assert!(index.status.success());
 
     let stderr = String::from_utf8_lossy(&index.stderr);
-    assert!(stderr.contains("scanned 100 files"));
+    assert!(stderr.contains("progress: 100/101 files"), "{stderr}");
+    assert!(stderr.contains("bytes"), "{stderr}");
+    assert!(stderr.contains("elapsed"), "{stderr}");
+    assert!(stderr.contains("eta"), "{stderr}");
+    assert!(stderr.contains("current "), "{stderr}");
 }

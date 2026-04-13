@@ -1,11 +1,12 @@
 use crate::config::{default_db_path, default_source_roots};
-use crate::indexer::index_sources_with_progress;
+use crate::indexer::{index_sources_with_progress, IndexReport};
 use crate::store::{SearchOptions, SearchResult, Store};
 use anyhow::{anyhow, bail, Context, Result};
 use serde_json::json;
 use std::ffi::OsString;
 use std::fs;
 use std::path::{Path, PathBuf};
+use std::time::{Duration, Instant};
 
 pub fn run(args: impl IntoIterator<Item = String>) -> Result<()> {
     let mut args = args.into_iter();
@@ -128,18 +129,20 @@ fn run_index(args: Vec<String>) -> Result<()> {
     }
 
     let store = Store::open(&db_path)?;
+    let started = Instant::now();
     let report = index_sources_with_progress(&store, &sources, |report| {
-        eprintln!(
-            "scanned {} files, indexed {} session files, skipped {}",
-            report.files_seen, report.sessions_indexed, report.files_skipped
-        );
+        eprintln!("{}", progress_line(report, started.elapsed()));
     })?;
     println!(
-        "indexed {} session files, {} events from {} files ({} skipped) into {}",
+        "indexed {} session files, {} events from {}/{} files ({} skipped: {} unchanged, {} missing, {} non-session) into {}",
         report.sessions_indexed,
         report.events_indexed,
         report.files_seen,
+        report.files_total,
         report.files_skipped,
+        report.skipped_unchanged,
+        report.skipped_missing,
+        report.skipped_non_session,
         db_path.display()
     );
     Ok(())
@@ -171,20 +174,112 @@ fn run_rebuild(args: Vec<String>) -> Result<()> {
 
     remove_db_files(&db_path)?;
     let store = Store::open(&db_path)?;
+    let started = Instant::now();
     let report = index_sources_with_progress(&store, &sources, |report| {
-        eprintln!(
-            "scanned {} files, indexed {} session files, skipped {}",
-            report.files_seen, report.sessions_indexed, report.files_skipped
-        );
+        eprintln!("{}", progress_line(report, started.elapsed()));
     })?;
     println!(
-        "rebuilt {} session files, {} events from {} files into {}",
+        "rebuilt {} session files, {} events from {}/{} files ({} skipped: {} unchanged, {} missing, {} non-session) into {}",
         report.sessions_indexed,
         report.events_indexed,
         report.files_seen,
+        report.files_total,
+        report.files_skipped,
+        report.skipped_unchanged,
+        report.skipped_missing,
+        report.skipped_non_session,
         db_path.display()
     );
     Ok(())
+}
+
+fn progress_line(report: &IndexReport, elapsed: Duration) -> String {
+    let percent = if report.files_total == 0 {
+        100.0
+    } else {
+        (report.files_seen as f64 / report.files_total as f64) * 100.0
+    };
+    let eta = estimate_eta(elapsed, report.files_seen, report.files_total)
+        .map(format_duration)
+        .unwrap_or_else(|| "unknown".to_owned());
+    let current = report
+        .current_file
+        .as_ref()
+        .map(|path| shorten_path(path, 96))
+        .unwrap_or_else(|| "-".to_owned());
+
+    format!(
+        "progress: {}/{} files ({percent:.1}%), bytes {}/{}, indexed {}, skipped {} (unchanged {}, missing {}, non-session {}), elapsed {}, eta {}, current {}",
+        report.files_seen,
+        report.files_total,
+        format_bytes(report.bytes_seen),
+        format_bytes(report.bytes_total),
+        report.sessions_indexed,
+        report.files_skipped,
+        report.skipped_unchanged,
+        report.skipped_missing,
+        report.skipped_non_session,
+        format_duration(elapsed),
+        eta,
+        current
+    )
+}
+
+fn estimate_eta(elapsed: Duration, seen: usize, total: usize) -> Option<Duration> {
+    if seen == 0 || total == 0 || seen >= total {
+        return None;
+    }
+    let elapsed_secs = elapsed.as_secs_f64();
+    if elapsed_secs <= 0.0 {
+        return None;
+    }
+    let per_file = elapsed_secs / seen as f64;
+    Some(Duration::from_secs_f64(per_file * (total - seen) as f64))
+}
+
+fn format_duration(duration: Duration) -> String {
+    let total = duration.as_secs();
+    let hours = total / 3600;
+    let minutes = (total % 3600) / 60;
+    let seconds = total % 60;
+    if hours > 0 {
+        format!("{hours}:{minutes:02}:{seconds:02}")
+    } else {
+        format!("{minutes}:{seconds:02}")
+    }
+}
+
+fn format_bytes(bytes: u64) -> String {
+    const UNITS: [&str; 5] = ["B", "KiB", "MiB", "GiB", "TiB"];
+    let mut value = bytes as f64;
+    let mut unit = 0;
+    while value >= 1024.0 && unit < UNITS.len() - 1 {
+        value /= 1024.0;
+        unit += 1;
+    }
+    if unit == 0 {
+        format!("{bytes} {}", UNITS[unit])
+    } else {
+        format!("{value:.1} {}", UNITS[unit])
+    }
+}
+
+fn shorten_path(path: &Path, max_chars: usize) -> String {
+    let value = path.display().to_string();
+    if value.chars().count() <= max_chars {
+        return value;
+    }
+
+    let tail_len = max_chars.saturating_sub(3);
+    let tail = value
+        .chars()
+        .rev()
+        .take(tail_len)
+        .collect::<Vec<_>>()
+        .into_iter()
+        .rev()
+        .collect::<String>();
+    format!("...{tail}")
 }
 
 fn run_search(args: Vec<String>) -> Result<()> {
