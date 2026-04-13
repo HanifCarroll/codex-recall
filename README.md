@@ -44,7 +44,6 @@ codex-recall show <session-id> --limit 20
 
 ## Local Verification
 
-The full archive on this machine indexed 1,079 session files and 472,286 events in about 59 seconds on the first run.
+The full archive on this machine parsed 1,079 session files in about 59 seconds on the first run.
 
 A repeat run skipped 1,077 unchanged files and completed in about 0.55 seconds.
-

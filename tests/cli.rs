@@ -45,7 +45,7 @@ fn index_then_search_outputs_ranked_receipts() {
         "index failed: {}",
         String::from_utf8_lossy(&index.stderr)
     );
-    assert!(String::from_utf8_lossy(&index.stdout).contains("indexed 1 sessions"));
+    assert!(String::from_utf8_lossy(&index.stdout).contains("indexed 1 session files"));
 
     let search = Command::new(env!("CARGO_BIN_EXE_codex-recall"))
         .args(["search", "webhook secret", "--db"])
