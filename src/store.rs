@@ -443,10 +443,14 @@ impl Store {
             .any(|column| column == "repo");
 
         if !has_repo {
-            self.conn.execute(
+            match self.conn.execute(
                 "ALTER TABLE sessions ADD COLUMN repo TEXT NOT NULL DEFAULT ''",
                 [],
-            )?;
+            ) {
+                Ok(_) => {}
+                Err(error) if error.to_string().contains("duplicate column name") => {}
+                Err(error) => return Err(error.into()),
+            }
         }
         Ok(())
     }
