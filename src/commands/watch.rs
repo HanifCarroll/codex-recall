@@ -6,9 +6,11 @@ use crate::store::Store;
 use anyhow::{anyhow, Context, Result};
 use clap::Args;
 use serde::{Deserialize, Serialize};
-use serde_json::json;
+use serde_json::{json, Value};
+use std::ffi::OsString;
 use std::fs;
 use std::path::{Path, PathBuf};
+use std::process::Command as ProcessCommand;
 use std::thread;
 use std::time::{Duration, Instant};
 
@@ -32,6 +34,8 @@ pub struct WatchArgs {
     pub once: bool,
     #[arg(long, help = "Write a macOS LaunchAgent plist for background indexing")]
     pub install_launch_agent: bool,
+    #[arg(long, help = "Bootstrap and verify the LaunchAgent after writing it")]
+    pub start_launch_agent: bool,
     #[arg(
         long,
         default_value = "com.hanif.codex-recall.watch",
@@ -58,10 +62,18 @@ pub struct StatusArgs {
     pub quiet_for: u64,
     #[arg(long, help = "Emit machine-readable JSON")]
     pub json: bool,
+    #[arg(
+        long,
+        default_value = "com.hanif.codex-recall.watch",
+        help = "LaunchAgent label"
+    )]
+    pub agent_label: String,
+    #[arg(long, help = "LaunchAgent plist path")]
+    pub agent_path: Option<PathBuf>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
-struct WatchState {
+pub(crate) struct WatchState {
     last_run_at: Option<String>,
     last_indexed_at: Option<String>,
     last_error: Option<String>,
@@ -70,6 +82,33 @@ struct WatchState {
     last_files_seen: usize,
     last_files_total: usize,
     pending_files: usize,
+}
+
+#[derive(Debug, Clone)]
+pub(crate) struct WatchStatusReport {
+    pub db_path: PathBuf,
+    pub db_exists: bool,
+    pub state_path: PathBuf,
+    pub sources: Vec<PathBuf>,
+    pub scan: SourceScanReport,
+    pub state: WatchState,
+    pub last_indexed_at: Option<String>,
+    pub freshness: FreshnessVerdict,
+    pub launch_agent: LaunchAgentStatus,
+}
+
+#[derive(Debug, Clone)]
+pub(crate) struct FreshnessVerdict {
+    pub state: &'static str,
+    pub message: String,
+}
+
+#[derive(Debug, Clone)]
+pub(crate) struct LaunchAgentStatus {
+    pub label: String,
+    pub path: PathBuf,
+    pub installed: bool,
+    pub running: Option<bool>,
 }
 
 pub fn run_watch(args: WatchArgs) -> Result<()> {
@@ -93,6 +132,10 @@ pub fn run_watch(args: WatchArgs) -> Result<()> {
             quiet_for,
         )?;
         println!("installed launch agent: {}", agent_path.display());
+        if args.start_launch_agent {
+            start_launch_agent(&args.agent_label, &agent_path)?;
+            println!("started launch agent: {}", args.agent_label);
+        }
         println!(
             "next: launchctl bootstrap gui/$(id -u) {}",
             agent_path.display()
@@ -186,58 +229,292 @@ pub fn run_status(args: StatusArgs) -> Result<()> {
     let state_path = args.state.unwrap_or(default_state_path()?);
     let sources = resolve_sources(args.sources)?;
     let quiet_for = Duration::from_secs(args.quiet_for);
-    let state = read_watch_state(&state_path).unwrap_or_default();
-    let (scan, last_indexed_at) = scan_status(&db_path, &sources, quiet_for)?;
-    let last_indexed_at = last_indexed_at.or(state.last_indexed_at.clone());
+    let agent_path = args
+        .agent_path
+        .unwrap_or(default_launch_agent_path(&args.agent_label)?);
+    let report = build_status_report(
+        db_path,
+        state_path,
+        sources,
+        quiet_for,
+        args.agent_label,
+        agent_path,
+    )?;
 
     if args.json {
-        let value = json!({
-            "db_path": db_path,
-            "db_exists": db_path.exists(),
-            "state_path": state_path,
-            "files_total": scan.files_total,
-            "pending_files": scan.pending_files,
-            "pending_bytes": scan.pending_bytes,
-            "stable_pending_files": scan.stable_pending_files,
-            "waiting_files": scan.waiting_files,
-            "missing_sources": scan.missing_sources,
-            "last_run_at": state.last_run_at,
-            "last_indexed_at": last_indexed_at,
-            "last_error": state.last_error,
-            "last_indexed_sessions": state.last_indexed_sessions,
-            "last_indexed_events": state.last_indexed_events,
-        });
-        println!("{}", serde_json::to_string_pretty(&value)?);
+        println!("{}", serde_json::to_string_pretty(&status_json(&report))?);
         return Ok(());
     }
 
-    let db_status = if db_path.exists() {
+    let db_status = if report.db_exists {
         "exists"
     } else {
         "missing"
     };
-    println!("database: {} ({db_status})", db_path.display());
-    println!("state: {}", state_path.display());
+    println!("database: {} ({db_status})", report.db_path.display());
+    println!("state: {}", report.state_path.display());
+    println!(
+        "freshness: {} ({})",
+        report.freshness.state, report.freshness.message
+    );
     println!(
         "pending: {} files, {} stable, {} waiting, {}",
-        scan.pending_files,
-        scan.stable_pending_files,
-        scan.waiting_files,
-        format_bytes(scan.pending_bytes)
+        report.scan.pending_files,
+        report.scan.stable_pending_files,
+        report.scan.waiting_files,
+        format_bytes(report.scan.pending_bytes)
     );
     println!(
         "last_indexed_at: {}",
-        last_indexed_at.unwrap_or_else(|| "never".to_owned())
+        report
+            .last_indexed_at
+            .clone()
+            .unwrap_or_else(|| "never".to_owned())
     );
     println!(
         "last_error: {}",
-        state.last_error.unwrap_or_else(|| "none".to_owned())
+        report
+            .state
+            .last_error
+            .clone()
+            .unwrap_or_else(|| "none".to_owned())
     );
-    for source in sources {
+    println!(
+        "launch_agent: {} (installed: {}, running: {})",
+        report.launch_agent.label,
+        report.launch_agent.installed,
+        report
+            .launch_agent
+            .running
+            .map(|running| running.to_string())
+            .unwrap_or_else(|| "unknown".to_owned())
+    );
+    for source in report.sources {
         let status = if source.exists() { "exists" } else { "missing" };
         println!("source: {} ({status})", source.display());
     }
     Ok(())
+}
+
+pub(crate) fn build_status_report(
+    db_path: PathBuf,
+    state_path: PathBuf,
+    sources: Vec<PathBuf>,
+    quiet_for: Duration,
+    agent_label: String,
+    agent_path: PathBuf,
+) -> Result<WatchStatusReport> {
+    let state = read_watch_state(&state_path).unwrap_or_default();
+    let (scan, last_indexed_at) = scan_status(&db_path, &sources, quiet_for)?;
+    let last_indexed_at = last_indexed_at.or(state.last_indexed_at.clone());
+    let db_exists = db_path.exists();
+    let launch_agent = launch_agent_status(agent_label, agent_path);
+    let freshness = freshness_verdict(db_exists, &scan, &state);
+
+    Ok(WatchStatusReport {
+        db_path,
+        db_exists,
+        state_path,
+        sources,
+        scan,
+        state,
+        last_indexed_at,
+        freshness,
+        launch_agent,
+    })
+}
+
+pub(crate) fn status_json(report: &WatchStatusReport) -> Value {
+    json!({
+        "db_path": report.db_path,
+        "db_exists": report.db_exists,
+        "state_path": report.state_path,
+        "sources": report.sources,
+        "files_total": report.scan.files_total,
+        "pending_files": report.scan.pending_files,
+        "pending_bytes": report.scan.pending_bytes,
+        "stable_pending_files": report.scan.stable_pending_files,
+        "waiting_files": report.scan.waiting_files,
+        "missing_sources": report.scan.missing_sources,
+        "freshness": report.freshness.state,
+        "freshness_message": report.freshness.message,
+        "last_run_at": report.state.last_run_at,
+        "last_indexed_at": report.last_indexed_at,
+        "last_error": report.state.last_error,
+        "last_indexed_sessions": report.state.last_indexed_sessions,
+        "last_indexed_events": report.state.last_indexed_events,
+        "launch_agent": {
+            "label": report.launch_agent.label,
+            "path": report.launch_agent.path,
+            "installed": report.launch_agent.installed,
+            "running": report.launch_agent.running,
+        },
+    })
+}
+
+fn freshness_verdict(
+    db_exists: bool,
+    scan: &SourceScanReport,
+    state: &WatchState,
+) -> FreshnessVerdict {
+    if let Some(error) = &state.last_error {
+        return FreshnessVerdict {
+            state: "stale",
+            message: format!("watcher last failed: {error}"),
+        };
+    }
+
+    if scan.pending_files > 0 && state.last_run_at.is_none() {
+        return FreshnessVerdict {
+            state: "watcher-not-running",
+            message: format!(
+                "{} pending stable files and no watcher state",
+                scan.stable_pending_files
+            ),
+        };
+    }
+
+    if scan.stable_pending_files > 0 || (!db_exists && scan.pending_files > 0) {
+        return FreshnessVerdict {
+            state: "stale",
+            message: format!(
+                "{} stable files are ready to index",
+                scan.stable_pending_files
+            ),
+        };
+    }
+
+    if scan.waiting_files > 0 {
+        return FreshnessVerdict {
+            state: "pending-live-writes",
+            message: format!(
+                "{} files are still within the quiet window",
+                scan.waiting_files
+            ),
+        };
+    }
+
+    if !scan.missing_sources.is_empty() {
+        return FreshnessVerdict {
+            state: "stale",
+            message: format!(
+                "{} configured sources are missing",
+                scan.missing_sources.len()
+            ),
+        };
+    }
+
+    FreshnessVerdict {
+        state: "fresh",
+        message: "index is current".to_owned(),
+    }
+}
+
+fn launch_agent_status(label: String, path: PathBuf) -> LaunchAgentStatus {
+    let installed = path.exists();
+    let running = if installed {
+        Some(is_launch_agent_running(&label))
+    } else {
+        None
+    };
+
+    LaunchAgentStatus {
+        label,
+        path,
+        installed,
+        running,
+    }
+}
+
+fn is_launch_agent_running(label: &str) -> bool {
+    let Ok(domain) = launch_agent_domain() else {
+        return false;
+    };
+    ProcessCommand::new(launchctl_executable())
+        .args(["print", &format!("{domain}/{label}")])
+        .output()
+        .map(|output| output.status.success())
+        .unwrap_or(false)
+}
+
+fn start_launch_agent(label: &str, path: &Path) -> Result<()> {
+    let domain = launch_agent_domain()?;
+    let bootstrap = ProcessCommand::new(launchctl_executable())
+        .args(["bootstrap", &domain])
+        .arg(path)
+        .output()
+        .context("run launchctl bootstrap")?;
+
+    if !bootstrap.status.success() && !launchctl_already_loaded(&bootstrap) {
+        return Err(anyhow!(
+            "launchctl bootstrap failed: {}{}",
+            String::from_utf8_lossy(&bootstrap.stdout),
+            String::from_utf8_lossy(&bootstrap.stderr)
+        ));
+    }
+
+    if !bootstrap.status.success() {
+        let kickstart = ProcessCommand::new(launchctl_executable())
+            .args(["kickstart", "-k", &format!("{domain}/{label}")])
+            .output()
+            .context("run launchctl kickstart")?;
+        if !kickstart.status.success() {
+            return Err(anyhow!(
+                "launchctl kickstart failed: {}{}",
+                String::from_utf8_lossy(&kickstart.stdout),
+                String::from_utf8_lossy(&kickstart.stderr)
+            ));
+        }
+    }
+
+    let print = ProcessCommand::new(launchctl_executable())
+        .args(["print", &format!("{domain}/{label}")])
+        .output()
+        .context("run launchctl print")?;
+    if !print.status.success() {
+        return Err(anyhow!(
+            "launchctl print failed after bootstrap: {}{}",
+            String::from_utf8_lossy(&print.stdout),
+            String::from_utf8_lossy(&print.stderr)
+        ));
+    }
+
+    Ok(())
+}
+
+fn launchctl_already_loaded(output: &std::process::Output) -> bool {
+    let text = format!(
+        "{}{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    )
+    .to_ascii_lowercase();
+    text.contains("already") && (text.contains("loaded") || text.contains("bootstrapped"))
+}
+
+fn launch_agent_domain() -> Result<String> {
+    if let Ok(uid) = std::env::var("CODEX_RECALL_UID") {
+        return Ok(format!("gui/{uid}"));
+    }
+    if let Ok(uid) = std::env::var("UID") {
+        return Ok(format!("gui/{uid}"));
+    }
+
+    let output = ProcessCommand::new("id")
+        .arg("-u")
+        .output()
+        .context("run id -u")?;
+    if !output.status.success() {
+        return Err(anyhow!("id -u failed"));
+    }
+    Ok(format!(
+        "gui/{}",
+        String::from_utf8_lossy(&output.stdout).trim()
+    ))
+}
+
+fn launchctl_executable() -> OsString {
+    std::env::var_os("CODEX_RECALL_LAUNCHCTL").unwrap_or_else(|| OsString::from("launchctl"))
 }
 
 fn scan_status(

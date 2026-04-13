@@ -207,7 +207,9 @@ where
 }
 
 fn should_report_after_file(report: &IndexReport) -> bool {
-    report.files_seen == 1 || report.files_seen % 25 == 0 || report.files_seen == report.files_total
+    report.files_seen == 1
+        || report.files_seen.is_multiple_of(25)
+        || report.files_seen == report.files_total
 }
 
 fn total_known_bytes(files: &[PathBuf]) -> u64 {
@@ -327,7 +329,7 @@ mod tests {
         write_session(&session_file, "First message");
         let store = Store::open(root.join("index.sqlite")).unwrap();
 
-        let first = index_sources(&store, &[source.clone()]).unwrap();
+        let first = index_sources(&store, std::slice::from_ref(&source)).unwrap();
         let second = index_sources(&store, &[source]).unwrap();
 
         assert_eq!(first.files_seen, 1);

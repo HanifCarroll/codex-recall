@@ -23,6 +23,9 @@ pub fn redact_secrets(text: &str) -> String {
             format!("{}{}", &captures[1], REDACTED)
         })
         .into_owned();
+    let text = private_key_block_regex()
+        .replace_all(&text, REDACTED)
+        .into_owned();
     token_regex().replace_all(&text, REDACTED).into_owned()
 }
 
@@ -42,6 +45,9 @@ fn has_secret_indicator(text: &str) -> bool {
         "access_key",
         "PRIVATE_KEY",
         "private_key",
+        "PRIVATE KEY",
+        "private key",
+        "BEGIN PRIVATE KEY",
         "DSN",
         "dsn",
         "COOKIE",
@@ -101,6 +107,14 @@ fn token_regex() -> &'static Regex {
     })
 }
 
+fn private_key_block_regex() -> &'static Regex {
+    static REGEX: OnceLock<Regex> = OnceLock::new();
+    REGEX.get_or_init(|| {
+        Regex::new(r#"(?is)-----BEGIN [A-Z ]*PRIVATE KEY-----.*?-----END [A-Z ]*PRIVATE KEY-----"#)
+            .expect("private key block redaction regex compiles")
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -131,5 +145,48 @@ mod tests {
         assert!(!redacted.contains("eyJhbGci"));
         assert!(!redacted.contains("github_pat_1234567890"));
         assert!(!redacted.contains("sk-abcdefghijklmnopqrstuvwxyz"));
+    }
+
+    #[test]
+    fn redacts_fixture_corpus_without_leaking_secret_values() {
+        let fixtures = [
+            (
+                "OPENAI_API_KEY = \"sk-proj-1234567890abcdefghijklmnop\"",
+                "sk-proj-1234567890abcdefghijklmnop",
+            ),
+            (
+                "STRIPE_WEBHOOK_SECRET='whsec_1234567890abcdefghijklmnop'",
+                "whsec_1234567890abcdefghijklmnop",
+            ),
+            (
+                "Authorization: Bearer abcdefghijklmnopqrstuvwxyz.1234567890",
+                "abcdefghijklmnopqrstuvwxyz.1234567890",
+            ),
+            (
+                r#"{"cookie":"sessionid=abc123456789; path=/"}"#,
+                "sessionid=abc123456789",
+            ),
+            (
+                "password : \"correct horse battery staple\"",
+                "correct horse battery staple",
+            ),
+            (
+                "-----BEGIN PRIVATE KEY-----\nabc123secret\n-----END PRIVATE KEY-----",
+                "abc123secret",
+            ),
+        ];
+
+        for (input, leaked_value) in fixtures {
+            let redacted = redact_secrets(input);
+
+            assert!(
+                redacted.contains(REDACTED),
+                "fixture was not redacted: {input}"
+            );
+            assert!(
+                !redacted.contains(leaked_value),
+                "fixture leaked {leaked_value}: {redacted}"
+            );
+        }
     }
 }

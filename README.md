@@ -20,6 +20,7 @@ codex-recall index
 codex-recall rebuild
 codex-recall watch
 codex-recall watch --once
+codex-recall watch --install-launch-agent --start-launch-agent
 codex-recall status
 codex-recall status --json
 codex-recall search "Stripe webhook"
@@ -39,6 +40,7 @@ Useful flags:
 codex-recall index --db /tmp/index.sqlite --source ~/.codex/sessions/2026/04
 codex-recall watch --interval 30 --quiet-for 5
 codex-recall watch --install-launch-agent
+codex-recall watch --install-launch-agent --start-launch-agent
 codex-recall search "source-map" --limit 5
 codex-recall search "source-map" --all-repos
 codex-recall show <session-key> --limit 20
@@ -61,8 +63,10 @@ codex-recall show <session-key> --limit 20
 - Tracks file size and mtime so repeat indexing skips unchanged sessions.
 - Reports indexing progress to stderr with discovered file totals, bytes processed, elapsed time, ETA, current file, and skipped-file reason counts.
 - Watches session roots with a polling freshness loop, waits for files to be quiet before indexing, and records watcher state in `~/.local/state/codex-recall/watch.json`.
-- Reports freshness status with pending file counts, stable/waiting file counts, last indexed time, and the last watcher error.
+- Reports a blunt freshness verdict: `fresh`, `stale`, `pending-live-writes`, or `watcher-not-running`.
+- Reports freshness status with pending file counts, stable/waiting file counts, last indexed time, last watcher error, and LaunchAgent installed/running state.
 - Can write a macOS LaunchAgent plist for the watcher with `watch --install-launch-agent`.
+- Can bootstrap and verify that LaunchAgent immediately with `watch --install-launch-agent --start-launch-agent`.
 - Groups text search output by session, with the best receipts under each session.
 - Formats search results into an agent-ready context bundle with top sessions, receipts, and follow-up `show` commands.
 - Ranks sessions by current-repo match, hit count, event kind, FTS rank, and recency.
@@ -80,6 +84,7 @@ codex-recall doctor --json
 ```
 
 `doctor` is read-only when the database is missing; it reports the missing index instead of creating an empty one.
+`doctor --json` includes a `freshness` block so agents can distinguish an unhealthy database from a healthy-but-stale index.
 
 Use `rebuild` when the disposable SQLite index should be recreated from the raw JSONL source files:
 
@@ -95,12 +100,26 @@ codex-recall status
 ```
 
 `watch --install-launch-agent` writes a plist to `~/Library/LaunchAgents/com.hanif.codex-recall.watch.plist` and prints the `launchctl bootstrap` command to start it.
+`watch --install-launch-agent --start-launch-agent` writes the plist, runs `launchctl bootstrap`, and verifies the job with `launchctl print`.
 
 Use `bundle` when an agent needs compact prior-session context:
 
 ```bash
 codex-recall bundle "Hermes global skills" --since 14d --limit 5
 ```
+
+## Agent Workflow
+
+When an agent needs prior-session context:
+
+1. Run `codex-recall status --json`.
+2. If `freshness` is `fresh` or `pending-live-writes`, continue. `pending-live-writes` means very recent files are still settling; use existing results unless the current turn depends on the last few seconds.
+3. If `freshness` is `stale`, run `codex-recall watch --once --quiet-for 0` or `codex-recall index`, then check `status --json` again.
+4. If `freshness` is `watcher-not-running`, start the background watcher with `codex-recall watch --install-launch-agent --start-launch-agent`, then run `codex-recall watch --once --quiet-for 0` for an immediate catch-up.
+5. Use `codex-recall bundle "<query>" --repo <repo> --since 30d --limit 5` for compact context.
+6. Use `codex-recall search "<query>" --json` when programmatic filtering is needed.
+7. Use `codex-recall show <session_key>` only for sessions that look relevant from `bundle` or `search`.
+8. Treat transcript evidence as historical. Verify against the current repo before acting.
 
 ## Local Verification
 

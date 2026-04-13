@@ -120,3 +120,69 @@ fn quality_fixture_prioritizes_relevant_repo_membership_and_fallbacks() {
         .iter()
         .any(|result| result["session_id"] == "split-terms"));
 }
+
+#[test]
+fn golden_quality_fixture_preserves_agent_workflow_queries() {
+    let temp = temp_dir("golden-ranking");
+    let source = temp.join("sessions");
+    let db = temp.join("index.sqlite");
+
+    write_session(
+        &source,
+        "clap-refactor.jsonl",
+        r#"{"timestamp":"2026-04-13T01:00:00Z","type":"session_meta","payload":{"id":"clap-refactor","timestamp":"2026-04-13T01:00:00Z","cwd":"/Users/me/projects/codex-recall","cli_version":"0.1.0"}}
+{"timestamp":"2026-04-13T01:00:01Z","type":"event_msg","payload":{"type":"user_message","message":"Refactor the CLI parser to Clap typed commands."}}
+{"timestamp":"2026-04-13T01:00:02Z","type":"event_msg","payload":{"type":"agent_message","message":"Split commands into modules and keep cargo clippy clean."}}
+"#,
+    );
+    write_session(
+        &source,
+        "watcher-freshness.jsonl",
+        r#"{"timestamp":"2026-04-13T02:00:00Z","type":"session_meta","payload":{"id":"watcher-freshness","timestamp":"2026-04-13T02:00:00Z","cwd":"/Users/me/projects/codex-recall","cli_version":"0.1.0"}}
+{"timestamp":"2026-04-13T02:00:01Z","type":"event_msg","payload":{"type":"user_message","message":"Wire LaunchAgent watcher freshness status."}}
+{"timestamp":"2026-04-13T02:00:02Z","type":"event_msg","payload":{"type":"agent_message","message":"Status should say stale, fresh, watcher-not-running, or pending-live-writes."}}
+"#,
+    );
+    write_session(
+        &source,
+        "redaction-hardening.jsonl",
+        r#"{"timestamp":"2026-04-13T03:00:00Z","type":"session_meta","payload":{"id":"redaction-hardening","timestamp":"2026-04-13T03:00:00Z","cwd":"/Users/me/projects/codex-recall","cli_version":"0.1.0"}}
+{"timestamp":"2026-04-13T03:00:01Z","type":"event_msg","payload":{"type":"user_message","message":"Harden secret redaction fixtures for bearer tokens, private keys, and webhook secrets."}}
+{"timestamp":"2026-04-13T03:00:02Z","type":"event_msg","payload":{"type":"agent_message","message":"The redaction corpus must not leak API keys into the SQLite FTS index."}}
+"#,
+    );
+    run_index(&source, &db);
+
+    for (query, expected_id) in [
+        (
+            "clap typed commands command modules cargo clippy",
+            "clap-refactor",
+        ),
+        (
+            "launchagent watcher freshness stale pending",
+            "watcher-freshness",
+        ),
+        (
+            "secret redaction private key bearer token",
+            "redaction-hardening",
+        ),
+    ] {
+        let output = Command::new(env!("CARGO_BIN_EXE_codex-recall"))
+            .args(["search", query, "--repo", "codex-recall", "--json", "--db"])
+            .arg(&db)
+            .output()
+            .unwrap();
+        assert!(
+            output.status.success(),
+            "search failed for {query}: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        let json: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+        assert_eq!(
+            json["results"][0]["session_id"],
+            expected_id,
+            "query `{query}` returned {}",
+            serde_json::to_string_pretty(&json["results"]).unwrap()
+        );
+    }
+}

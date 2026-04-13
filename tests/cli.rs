@@ -602,9 +602,74 @@ fn status_json_reports_pending_files_without_creating_missing_database() {
 
     let json: serde_json::Value = serde_json::from_slice(&status.stdout).unwrap();
     assert_eq!(json["db_exists"], false);
+    assert_eq!(json["freshness"], "watcher-not-running");
     assert_eq!(json["pending_files"], 1);
     assert_eq!(json["last_error"], serde_json::Value::Null);
     assert!(!db.exists(), "status should not create the database");
+}
+
+#[test]
+fn status_json_reports_fresh_and_live_write_verdicts() {
+    let temp = temp_dir("status-freshness");
+    let source = temp.join("sessions");
+    let db = temp.join("index.sqlite");
+    let state = temp.join("watch-state.json");
+    write_sample_session(&source);
+
+    let watch = Command::new(env!("CARGO_BIN_EXE_codex-recall"))
+        .args([
+            "watch",
+            "--once",
+            "--quiet-for",
+            "0",
+            "--interval",
+            "0",
+            "--db",
+        ])
+        .arg(&db)
+        .args(["--state"])
+        .arg(&state)
+        .args(["--source"])
+        .arg(&source)
+        .output()
+        .unwrap();
+    assert!(watch.status.success());
+
+    let fresh = Command::new(env!("CARGO_BIN_EXE_codex-recall"))
+        .args(["status", "--json", "--db"])
+        .arg(&db)
+        .args(["--state"])
+        .arg(&state)
+        .args(["--source"])
+        .arg(&source)
+        .output()
+        .unwrap();
+    assert!(fresh.status.success());
+    let json: serde_json::Value = serde_json::from_slice(&fresh.stdout).unwrap();
+    assert_eq!(json["freshness"], "fresh");
+    assert_eq!(json["freshness_message"], "index is current");
+
+    write_session_file(
+        &source,
+        "live.jsonl",
+        "live-write",
+        "/Users/me/project",
+        "2026-04-13T02:00:00Z",
+        "A live write is still settling.",
+    );
+    let live = Command::new(env!("CARGO_BIN_EXE_codex-recall"))
+        .args(["status", "--json", "--quiet-for", "86400", "--db"])
+        .arg(&db)
+        .args(["--state"])
+        .arg(&state)
+        .args(["--source"])
+        .arg(&source)
+        .output()
+        .unwrap();
+    assert!(live.status.success());
+    let json: serde_json::Value = serde_json::from_slice(&live.stdout).unwrap();
+    assert_eq!(json["freshness"], "pending-live-writes");
+    assert_eq!(json["waiting_files"], 1);
 }
 
 #[test]
@@ -696,6 +761,98 @@ fn watch_installs_launch_agent_plist_when_requested() {
     assert!(plist.contains("<string>--interval</string>"), "{plist}");
     assert!(plist.contains("<string>60</string>"), "{plist}");
     assert!(plist.contains(source.to_str().unwrap()), "{plist}");
+}
+
+#[test]
+fn watch_can_install_and_start_launch_agent_with_configurable_launchctl() {
+    let temp = temp_dir("watch-launch-agent-start");
+    let source = temp.join("sessions");
+    let db = temp.join("index.sqlite");
+    let state = temp.join("watch-state.json");
+    let agent = temp.join("com.example.codex-recall.watch.plist");
+    let launchctl_log = temp.join("launchctl.log");
+    let fake_launchctl = temp.join("launchctl");
+    fs::create_dir_all(&source).unwrap();
+    fs::write(
+        &fake_launchctl,
+        format!(
+            "#!/bin/sh\nprintf '%s ' \"$@\" >> {}\nprintf '\\n' >> {}\nexit 0\n",
+            launchctl_log.display(),
+            launchctl_log.display()
+        ),
+    )
+    .unwrap();
+    let chmod = Command::new("chmod")
+        .args(["+x"])
+        .arg(&fake_launchctl)
+        .output()
+        .unwrap();
+    assert!(chmod.status.success());
+
+    let install = Command::new(env!("CARGO_BIN_EXE_codex-recall"))
+        .env("CODEX_RECALL_LAUNCHCTL", &fake_launchctl)
+        .env("CODEX_RECALL_UID", "501")
+        .args([
+            "watch",
+            "--install-launch-agent",
+            "--start-launch-agent",
+            "--agent-label",
+            "com.example.codex-recall.watch",
+            "--agent-path",
+        ])
+        .arg(&agent)
+        .args(["--db"])
+        .arg(&db)
+        .args(["--state"])
+        .arg(&state)
+        .args(["--source"])
+        .arg(&source)
+        .args(["--interval", "60", "--quiet-for", "5"])
+        .output()
+        .unwrap();
+    assert!(
+        install.status.success(),
+        "install failed: {}",
+        String::from_utf8_lossy(&install.stderr)
+    );
+
+    let stdout = String::from_utf8_lossy(&install.stdout);
+    assert!(stdout.contains("installed launch agent"), "{stdout}");
+    assert!(stdout.contains("started launch agent"), "{stdout}");
+    let log = fs::read_to_string(launchctl_log).unwrap();
+    assert!(log.contains("bootstrap gui/501"), "{log}");
+    assert!(log.contains(agent.to_str().unwrap()), "{log}");
+    assert!(
+        log.contains("print gui/501/com.example.codex-recall.watch"),
+        "{log}"
+    );
+}
+
+#[test]
+fn doctor_json_includes_freshness_verdict() {
+    let temp = temp_dir("doctor-freshness");
+    let source = temp.join("sessions");
+    let db = temp.join("index.sqlite");
+    let state = temp.join("watch-state.json");
+    write_sample_session(&source);
+
+    let doctor = Command::new(env!("CARGO_BIN_EXE_codex-recall"))
+        .args(["doctor", "--json", "--db"])
+        .arg(&db)
+        .args(["--state"])
+        .arg(&state)
+        .args(["--source"])
+        .arg(&source)
+        .output()
+        .unwrap();
+    assert!(doctor.status.success());
+    let json: serde_json::Value = serde_json::from_slice(&doctor.stdout).unwrap();
+    assert_eq!(json["ok"], false);
+    assert_eq!(json["freshness"]["state"], "watcher-not-running");
+    assert!(json["freshness"]["message"]
+        .as_str()
+        .unwrap()
+        .contains("pending stable files"));
 }
 
 #[test]
