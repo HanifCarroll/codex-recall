@@ -2,6 +2,7 @@ use crate::parser::parse_session_file;
 use crate::store::{build_session_key, Store};
 use anyhow::{Context, Result};
 use std::fs;
+use std::io::ErrorKind;
 use std::path::{Path, PathBuf};
 use std::time::UNIX_EPOCH;
 
@@ -38,7 +39,14 @@ where
             if report.files_seen % 100 == 0 {
                 on_progress(&report);
             }
-            let file_state = FileState::from_path(&path)?;
+            let file_state = match FileState::from_path(&path) {
+                Ok(file_state) => file_state,
+                Err(error) if is_not_found_error(&error) => {
+                    report.files_skipped += 1;
+                    continue;
+                }
+                Err(error) => return Err(error),
+            };
             if store.is_source_current(
                 &path,
                 file_state.source_file_mtime_ns,
@@ -48,7 +56,16 @@ where
                 continue;
             }
 
-            if let Some(parsed) = parse_session_file(&path)? {
+            let parsed = match parse_session_file(&path) {
+                Ok(parsed) => parsed,
+                Err(error) if is_not_found_error(&error) => {
+                    report.files_skipped += 1;
+                    continue;
+                }
+                Err(error) => return Err(error),
+            };
+
+            if let Some(parsed) = parsed {
                 let session_key =
                     build_session_key(&parsed.session.id, &parsed.session.source_file_path);
                 report.events_indexed += parsed.events.len();
@@ -100,6 +117,14 @@ impl FileState {
     }
 }
 
+fn is_not_found_error(error: &anyhow::Error) -> bool {
+    error.chain().any(|cause| {
+        cause
+            .downcast_ref::<std::io::Error>()
+            .is_some_and(|io_error| io_error.kind() == ErrorKind::NotFound)
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -144,6 +169,35 @@ mod tests {
         assert_eq!(second.files_seen, 1);
         assert_eq!(second.files_skipped, 1);
         assert_eq!(second.sessions_indexed, 0);
+    }
+
+    #[test]
+    fn skips_files_removed_after_scan() {
+        let root = temp_root("removed-after-scan");
+        let source = root.join("sessions");
+        std::fs::create_dir_all(&source).unwrap();
+        for index in 0..99 {
+            write_session(
+                &source.join(format!("a-{index:03}.jsonl")),
+                &format!("Message {index}"),
+            );
+        }
+        let disappearing = source.join("z-disappearing.jsonl");
+        write_session(&disappearing, "This file disappears during indexing");
+        let store = Store::open(root.join("index.sqlite")).unwrap();
+
+        let mut removed = false;
+        let report = index_sources_with_progress(&store, &[source], |report| {
+            if report.files_seen == 100 && !removed {
+                std::fs::remove_file(&disappearing).unwrap();
+                removed = true;
+            }
+        })
+        .unwrap();
+
+        assert_eq!(report.files_seen, 100);
+        assert_eq!(report.files_skipped, 1);
+        assert_eq!(report.sessions_indexed, 99);
     }
 }
 
