@@ -52,10 +52,11 @@ fn run_index(args: Vec<String>) -> Result<()> {
     let store = Store::open(&db_path)?;
     let report = index_sources(&store, &sources)?;
     println!(
-        "indexed {} sessions, {} events from {} files into {}",
+        "indexed {} sessions, {} events from {} files ({} skipped) into {}",
         report.sessions_indexed,
         report.events_indexed,
         report.files_seen,
+        report.files_skipped,
         db_path.display()
     );
     Ok(())

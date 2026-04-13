@@ -130,6 +130,58 @@ impl Store {
             .map_err(Into::into)
     }
 
+    pub fn is_source_current(
+        &self,
+        source_file_path: &Path,
+        source_file_mtime_ns: i64,
+        source_file_size: i64,
+    ) -> Result<bool> {
+        let count = self.conn.query_row(
+            r#"
+            SELECT COUNT(*)
+            FROM ingestion_state
+            WHERE source_file_path = ?
+              AND source_file_mtime_ns = ?
+              AND source_file_size = ?
+            "#,
+            params![
+                source_file_path.display().to_string(),
+                source_file_mtime_ns,
+                source_file_size
+            ],
+            |row| row.get::<_, i64>(0),
+        )?;
+        Ok(count > 0)
+    }
+
+    pub fn mark_source_indexed(
+        &self,
+        source_file_path: &Path,
+        source_file_mtime_ns: i64,
+        source_file_size: i64,
+        session_id: Option<&str>,
+    ) -> Result<()> {
+        self.conn.execute(
+            r#"
+            INSERT INTO ingestion_state (
+                source_file_path, source_file_mtime_ns, source_file_size, session_id, indexed_at
+            ) VALUES (?, ?, ?, ?, strftime('%Y-%m-%dT%H:%M:%fZ','now'))
+            ON CONFLICT(source_file_path) DO UPDATE SET
+                source_file_mtime_ns = excluded.source_file_mtime_ns,
+                source_file_size = excluded.source_file_size,
+                session_id = excluded.session_id,
+                indexed_at = excluded.indexed_at
+            "#,
+            params![
+                source_file_path.display().to_string(),
+                source_file_mtime_ns,
+                source_file_size,
+                session_id,
+            ],
+        )?;
+        Ok(())
+    }
+
     fn init_schema(&self) -> Result<()> {
         self.conn.execute_batch(
             r#"
@@ -168,6 +220,14 @@ impl Store {
                 kind UNINDEXED,
                 text,
                 tokenize = 'porter unicode61'
+            );
+
+            CREATE TABLE IF NOT EXISTS ingestion_state (
+                source_file_path TEXT PRIMARY KEY,
+                source_file_mtime_ns INTEGER NOT NULL,
+                source_file_size INTEGER NOT NULL,
+                session_id TEXT,
+                indexed_at TEXT NOT NULL
             );
             "#,
         )?;
