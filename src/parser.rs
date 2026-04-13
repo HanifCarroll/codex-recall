@@ -50,6 +50,15 @@ impl EventKind {
             EventKind::Command => "command",
         }
     }
+
+    pub fn from_str(value: &str) -> Option<Self> {
+        match value {
+            "user_message" => Some(EventKind::UserMessage),
+            "assistant_message" => Some(EventKind::AssistantMessage),
+            "command" => Some(EventKind::Command),
+            _ => None,
+        }
+    }
 }
 
 pub fn parse_session_file(path: &Path) -> Result<Option<ParsedSession>> {
