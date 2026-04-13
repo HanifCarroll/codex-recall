@@ -221,6 +221,9 @@ fn non_empty_text_event(
     if text.is_empty() {
         return None;
     }
+    if is_codex_preamble(text) {
+        return None;
+    }
 
     Some(ParsedEvent {
         session_id: String::new(),
@@ -234,6 +237,11 @@ fn non_empty_text_event(
         source_file_path: path.to_path_buf(),
         source_line_number,
     })
+}
+
+fn is_codex_preamble(text: &str) -> bool {
+    let trimmed = text.trim_start();
+    trimmed.starts_with("# AGENTS.md instructions") || trimmed.contains("<environment_context>")
 }
 
 fn parse_command_event(
@@ -386,5 +394,21 @@ mod tests {
 
         assert_eq!(parsed.events.len(), 1);
         assert_eq!(parsed.events[0].source_line_number, 2);
+    }
+
+    #[test]
+    fn skips_codex_instruction_preamble_messages() {
+        let path = temp_jsonl(
+            "preamble",
+            r##"{"timestamp":"2026-04-13T01:00:00Z","type":"session_meta","payload":{"id":"session-4","timestamp":"2026-04-13T01:00:00Z","cwd":"/tmp"}}
+{"timestamp":"2026-04-13T01:00:01Z","type":"event_msg","payload":{"type":"user_message","message":"# AGENTS.md instructions for /tmp\n\n<environment_context>\n  <cwd>/tmp</cwd>\n</environment_context>"}}
+{"timestamp":"2026-04-13T01:00:02Z","type":"event_msg","payload":{"type":"user_message","message":"What did we decide about Sentry?"}}
+"##,
+        );
+
+        let parsed = parse_session_file(&path).unwrap().unwrap();
+
+        assert_eq!(parsed.events.len(), 1);
+        assert_eq!(parsed.events[0].text, "What did we decide about Sentry?");
     }
 }
