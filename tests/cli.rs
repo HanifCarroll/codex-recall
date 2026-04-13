@@ -907,3 +907,192 @@ fn bundle_outputs_agent_ready_context() {
     assert!(stdout.contains("stripe"), "{stdout}");
     assert!(stdout.contains("codex-recall show"), "{stdout}");
 }
+
+#[test]
+fn recent_lists_latest_sessions_with_filters() {
+    let temp = temp_dir("recent");
+    let source = temp.join("sessions");
+    let db = temp.join("index.sqlite");
+    write_session(
+        &source,
+        "old-project",
+        "/Users/me/projects/project",
+        "2026-04-01T01:00:00Z",
+    );
+    write_session(
+        &source,
+        "new-project",
+        "/Users/me/projects/project",
+        "2026-04-13T02:00:00Z",
+    );
+    write_session(
+        &source,
+        "new-other",
+        "/Users/me/projects/other",
+        "2026-04-13T03:00:00Z",
+    );
+
+    let index = Command::new(env!("CARGO_BIN_EXE_codex-recall"))
+        .args(["index", "--db"])
+        .arg(&db)
+        .args(["--source"])
+        .arg(&source)
+        .output()
+        .unwrap();
+    assert!(index.status.success());
+
+    let recent = Command::new(env!("CARGO_BIN_EXE_codex-recall"))
+        .args([
+            "recent",
+            "--repo",
+            "project",
+            "--since",
+            "2026-04-10",
+            "--db",
+        ])
+        .arg(&db)
+        .output()
+        .unwrap();
+    assert!(
+        recent.status.success(),
+        "recent failed: {}",
+        String::from_utf8_lossy(&recent.stderr)
+    );
+
+    let stdout = String::from_utf8_lossy(&recent.stdout);
+    assert!(stdout.contains("new-project"), "{stdout}");
+    assert!(stdout.contains("codex-recall show"), "{stdout}");
+    assert!(!stdout.contains("old-project"), "{stdout}");
+    assert!(!stdout.contains("new-other"), "{stdout}");
+}
+
+#[test]
+fn pin_stores_durable_session_anchor_and_pins_filters_it() {
+    let temp = temp_dir("pins");
+    let source = temp.join("sessions");
+    let db = temp.join("index.sqlite");
+    let pins = temp.join("pins.json");
+    write_session_file(
+        &source,
+        "watcher.jsonl",
+        "watcher-session",
+        "/Users/me/projects/codex-recall",
+        "2026-04-13T02:00:00Z",
+        "LaunchAgent watcher freshness decision.",
+    );
+    write_session_file(
+        &source,
+        "other.jsonl",
+        "other-session",
+        "/Users/me/projects/other",
+        "2026-04-13T03:00:00Z",
+        "Different project decision.",
+    );
+
+    let index = Command::new(env!("CARGO_BIN_EXE_codex-recall"))
+        .args(["index", "--db"])
+        .arg(&db)
+        .args(["--source"])
+        .arg(&source)
+        .output()
+        .unwrap();
+    assert!(index.status.success());
+
+    let search = Command::new(env!("CARGO_BIN_EXE_codex-recall"))
+        .args(["search", "watcher freshness", "--json", "--db"])
+        .arg(&db)
+        .output()
+        .unwrap();
+    assert!(search.status.success());
+    let json: serde_json::Value = serde_json::from_slice(&search.stdout).unwrap();
+    let session_key = json["results"][0]["session_key"].as_str().unwrap();
+
+    let pin = Command::new(env!("CARGO_BIN_EXE_codex-recall"))
+        .args(["pin", session_key, "--label", "watcher design", "--db"])
+        .arg(&db)
+        .args(["--pins"])
+        .arg(&pins)
+        .output()
+        .unwrap();
+    assert!(
+        pin.status.success(),
+        "pin failed: {}",
+        String::from_utf8_lossy(&pin.stderr)
+    );
+    assert!(String::from_utf8_lossy(&pin.stdout).contains("pinned watcher-session"));
+
+    let pins_output = Command::new(env!("CARGO_BIN_EXE_codex-recall"))
+        .args(["pins", "--repo", "codex-recall", "--pins"])
+        .arg(&pins)
+        .output()
+        .unwrap();
+    assert!(
+        pins_output.status.success(),
+        "pins failed: {}",
+        String::from_utf8_lossy(&pins_output.stderr)
+    );
+
+    let stdout = String::from_utf8_lossy(&pins_output.stdout);
+    assert!(stdout.contains("watcher design"), "{stdout}");
+    assert!(stdout.contains("watcher-session"), "{stdout}");
+    assert!(stdout.contains("codex-recall show"), "{stdout}");
+    assert!(!stdout.contains("other-session"), "{stdout}");
+
+    let pins_json = fs::read_to_string(&pins).unwrap();
+    assert!(pins_json.contains("watcher design"), "{pins_json}");
+    assert!(pins_json.contains(session_key), "{pins_json}");
+}
+
+#[test]
+fn pins_filter_by_command_cwd_repo_membership() {
+    let temp = temp_dir("pins-command-repo");
+    let source = temp.join("sessions");
+    let db = temp.join("index.sqlite");
+    let pins = temp.join("pins.json");
+    let session_dir = source.join("2026/04/13");
+    fs::create_dir_all(&session_dir).unwrap();
+    fs::write(
+        session_dir.join("mixed-repo.jsonl"),
+        r#"{"timestamp":"2026-04-13T01:00:00Z","type":"session_meta","payload":{"id":"mixed-repo","timestamp":"2026-04-13T01:00:00Z","cwd":"/Users/me/hanif-md","cli_version":"0.1.0"}}
+{"timestamp":"2026-04-13T01:00:01Z","type":"event_msg","payload":{"type":"exec_command_end","command":["/bin/zsh","-lc","cargo test"],"cwd":"/Users/me/projects/codex-recall","exit_code":0,"aggregated_output":"watcher freshness tested"}}
+"#,
+    )
+    .unwrap();
+
+    let index = Command::new(env!("CARGO_BIN_EXE_codex-recall"))
+        .args(["index", "--db"])
+        .arg(&db)
+        .args(["--source"])
+        .arg(&source)
+        .output()
+        .unwrap();
+    assert!(index.status.success());
+
+    let search = Command::new(env!("CARGO_BIN_EXE_codex-recall"))
+        .args(["search", "watcher freshness", "--json", "--db"])
+        .arg(&db)
+        .output()
+        .unwrap();
+    assert!(search.status.success());
+    let json: serde_json::Value = serde_json::from_slice(&search.stdout).unwrap();
+    let session_key = json["results"][0]["session_key"].as_str().unwrap();
+
+    let pin = Command::new(env!("CARGO_BIN_EXE_codex-recall"))
+        .args(["pin", session_key, "--label", "mixed repo", "--db"])
+        .arg(&db)
+        .args(["--pins"])
+        .arg(&pins)
+        .output()
+        .unwrap();
+    assert!(pin.status.success());
+
+    let pins_output = Command::new(env!("CARGO_BIN_EXE_codex-recall"))
+        .args(["pins", "--repo", "codex-recall", "--pins"])
+        .arg(&pins)
+        .output()
+        .unwrap();
+    assert!(pins_output.status.success());
+    let stdout = String::from_utf8_lossy(&pins_output.stdout);
+    assert!(stdout.contains("mixed repo"), "{stdout}");
+    assert!(stdout.contains("codex-recall"), "{stdout}");
+}

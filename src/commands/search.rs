@@ -20,7 +20,7 @@ pub struct SearchArgs {
     pub all_repos: bool,
     #[arg(long, help = "Restrict matches to sessions under this cwd")]
     pub cwd: Option<String>,
-    #[arg(long, help = "Restrict by age, for example 7d, 24h, or 2026-04-01")]
+    #[arg(long, help = "Restrict by age, for example 7d, today, or 2026-04-01")]
     pub since: Option<String>,
     #[arg(long, help = "Emit machine-readable JSON")]
     pub json: bool,
@@ -40,7 +40,7 @@ pub struct BundleArgs {
     pub all_repos: bool,
     #[arg(long, help = "Restrict matches to sessions under this cwd")]
     pub cwd: Option<String>,
-    #[arg(long, help = "Restrict by age, for example 7d, 24h, or 2026-04-01")]
+    #[arg(long, help = "Restrict by age, for example 7d, today, or 2026-04-01")]
     pub since: Option<String>,
 }
 

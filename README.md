@@ -28,8 +28,11 @@ codex-recall search "Stripe webhook" --repo palabruno --since 2026-04-01
 codex-recall search "Stripe webhook" --since 7d
 codex-recall search "Stripe webhook" --cwd projects/palabruno
 codex-recall search "Stripe webhook" --json
+codex-recall recent --repo palabruno --since 7d
 codex-recall bundle "Stripe webhook" --repo palabruno --since 14d
 codex-recall show <session-id-or-session-key>
+codex-recall pin <session-key> --label "watcher design"
+codex-recall pins --repo codex-recall
 codex-recall doctor --json
 codex-recall stats
 ```
@@ -43,7 +46,9 @@ codex-recall watch --install-launch-agent
 codex-recall watch --install-launch-agent --start-launch-agent
 codex-recall search "source-map" --limit 5
 codex-recall search "source-map" --all-repos
+codex-recall recent --limit 10
 codex-recall show <session-key> --limit 20
+codex-recall pin <session-key> --label "canonical decision" --pins /tmp/pins.json
 ```
 
 ## Behavior
@@ -68,7 +73,9 @@ codex-recall show <session-key> --limit 20
 - Can write a macOS LaunchAgent plist for the watcher with `watch --install-launch-agent`.
 - Can bootstrap and verify that LaunchAgent immediately with `watch --install-launch-agent --start-launch-agent`.
 - Groups text search output by session, with the best receipts under each session.
+- Lists recent sessions without a query when you know the timeframe or repo but not the exact words to search.
 - Formats search results into an agent-ready context bundle with top sessions, receipts, and follow-up `show` commands.
+- Stores durable labeled pins in `~/.local/share/codex-recall/pins.json`, outside the disposable SQLite index.
 - Ranks sessions by current-repo match, hit count, event kind, FTS rank, and recency.
 - Reports source-file counts and duplicate source-file counts in `stats`.
 - Keeps `--json` output compact by returning `text_preview` instead of full transcript blobs.
@@ -108,6 +115,19 @@ Use `bundle` when an agent needs compact prior-session context:
 codex-recall bundle "Hermes global skills" --since 14d --limit 5
 ```
 
+Use `recent` when you do not know the right query yet:
+
+```bash
+codex-recall recent --repo codex-recall --since 7d --limit 10
+```
+
+Use `pin` after finding a high-value session that should be easy to return to:
+
+```bash
+codex-recall pin <session-key> --label "watcher freshness design"
+codex-recall pins --repo codex-recall
+```
+
 ## Agent Workflow
 
 When an agent needs prior-session context:
@@ -116,10 +136,12 @@ When an agent needs prior-session context:
 2. If `freshness` is `fresh` or `pending-live-writes`, continue. `pending-live-writes` means very recent files are still settling; use existing results unless the current turn depends on the last few seconds.
 3. If `freshness` is `stale`, run `codex-recall watch --once --quiet-for 0` or `codex-recall index`, then check `status --json` again.
 4. If `freshness` is `watcher-not-running`, start the background watcher with `codex-recall watch --install-launch-agent --start-launch-agent`, then run `codex-recall watch --once --quiet-for 0` for an immediate catch-up.
-5. Use `codex-recall bundle "<query>" --repo <repo> --since 30d --limit 5` for compact context.
-6. Use `codex-recall search "<query>" --json` when programmatic filtering is needed.
-7. Use `codex-recall show <session_key>` only for sessions that look relevant from `bundle` or `search`.
-8. Treat transcript evidence as historical. Verify against the current repo before acting.
+5. Use `codex-recall recent --repo <repo> --since 7d --limit 10` when you do not know the right search terms yet.
+6. Use `codex-recall bundle "<query>" --repo <repo> --since 30d --limit 5` for compact context.
+7. Use `codex-recall search "<query>" --json` when programmatic filtering is needed.
+8. Use `codex-recall show <session_key>` only for sessions that look relevant from `bundle`, `search`, or `recent`.
+9. Use `codex-recall pin <session_key> --label "<why this matters>"` for canonical decisions or sessions that are likely to be reused.
+10. Treat transcript evidence as historical. Verify against the current repo before acting.
 
 ## Local Verification
 

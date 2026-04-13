@@ -31,6 +31,18 @@ pub fn default_state_path() -> Result<PathBuf> {
         .join("watch.json"))
 }
 
+pub fn default_pins_path() -> Result<PathBuf> {
+    if let Ok(path) = std::env::var("CODEX_RECALL_PINS") {
+        return Ok(PathBuf::from(path));
+    }
+
+    Ok(home_dir()?
+        .join(".local")
+        .join("share")
+        .join("codex-recall")
+        .join("pins.json"))
+}
+
 pub fn default_source_roots() -> Result<Vec<PathBuf>> {
     let home = home_dir()?;
     Ok(vec![

@@ -80,6 +80,35 @@ pub struct SessionMatch {
     pub source_file_path: PathBuf,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RecentSession {
+    pub session_key: String,
+    pub session_id: String,
+    pub repo: String,
+    pub cwd: String,
+    pub session_timestamp: String,
+    pub source_file_path: PathBuf,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RecentOptions {
+    pub limit: usize,
+    pub repo: Option<String>,
+    pub cwd: Option<String>,
+    pub since: Option<String>,
+}
+
+impl Default for RecentOptions {
+    fn default() -> Self {
+        Self {
+            limit: 20,
+            repo: None,
+            cwd: None,
+            since: None,
+        }
+    }
+}
+
 struct OldSessionRow {
     session_id: String,
     session_timestamp: String,
@@ -358,6 +387,80 @@ impl Store {
             .map_err(Into::into)
     }
 
+    pub fn recent_sessions(&self, options: RecentOptions) -> Result<Vec<RecentSession>> {
+        let limit = options.limit.clamp(1, 100);
+        let mut query_params = Vec::<String>::new();
+        let mut sql = r#"
+            SELECT
+                sessions.session_key,
+                sessions.session_id,
+                sessions.repo,
+                sessions.cwd,
+                sessions.session_timestamp,
+                sessions.source_file_path
+            FROM sessions
+            WHERE 1 = 1
+            "#
+        .to_owned();
+
+        if let Some(repo) = &options.repo {
+            sql.push_str(
+                r#"
+                AND EXISTS (
+                    SELECT 1 FROM session_repos filter_repos
+                    WHERE filter_repos.session_key = sessions.session_key
+                      AND lower(filter_repos.repo) = lower(?)
+                )
+                "#,
+            );
+            query_params.push(repo.clone());
+        }
+        if let Some(cwd) = &options.cwd {
+            sql.push_str(
+                r#"
+                AND (
+                    sessions.cwd LIKE '%' || ? || '%'
+                    OR EXISTS (
+                        SELECT 1 FROM events cwd_events
+                        WHERE cwd_events.session_key = sessions.session_key
+                          AND cwd_events.cwd LIKE '%' || ? || '%'
+                    )
+                )
+                "#,
+            );
+            query_params.push(cwd.clone());
+            query_params.push(cwd.clone());
+        }
+        if let Some(since) = &options.since {
+            append_since_clause(&mut sql, &mut query_params, since)?;
+        }
+
+        sql.push_str(
+            r#"
+            ORDER BY datetime(replace(replace(sessions.session_timestamp, 'T', ' '), 'Z', '')) DESC,
+                     sessions.source_file_path ASC
+            LIMIT ?
+            "#,
+        );
+        query_params.push(limit.to_string());
+
+        let mut statement = self.conn.prepare(&sql)?;
+        let rows = statement.query_map(params_from_iter(query_params.iter()), |row| {
+            let source_file_path: String = row.get(5)?;
+            Ok(RecentSession {
+                session_key: row.get(0)?,
+                session_id: row.get(1)?,
+                repo: row.get(2)?,
+                cwd: row.get(3)?,
+                session_timestamp: row.get(4)?,
+                source_file_path: PathBuf::from(source_file_path),
+            })
+        })?;
+
+        rows.collect::<std::result::Result<Vec<_>, _>>()
+            .map_err(Into::into)
+    }
+
     pub fn session_events(&self, session_key: &str, limit: usize) -> Result<Vec<SessionEvent>> {
         let limit = limit.clamp(1, 500);
         let mut statement = self.conn.prepare(
@@ -402,6 +505,21 @@ impl Store {
                 source_timestamp: row.get(7)?,
             })
         })?;
+
+        rows.collect::<std::result::Result<Vec<_>, _>>()
+            .map_err(Into::into)
+    }
+
+    pub fn session_repos(&self, session_key: &str) -> Result<Vec<String>> {
+        let mut statement = self.conn.prepare(
+            r#"
+            SELECT repo
+            FROM session_repos
+            WHERE session_key = ?
+            ORDER BY lower(repo) ASC
+            "#,
+        )?;
+        let rows = statement.query_map(params![session_key], |row| row.get::<_, String>(0))?;
 
         rows.collect::<std::result::Result<Vec<_>, _>>()
             .map_err(Into::into)
