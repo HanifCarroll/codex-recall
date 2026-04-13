@@ -4,6 +4,7 @@ use crate::store::{SessionMatch, Store};
 use anyhow::{bail, Context, Result};
 use clap::Args;
 use serde::{Deserialize, Serialize};
+use serde_json::json;
 use std::fs;
 use std::path::{Path, PathBuf};
 
@@ -29,6 +30,16 @@ pub struct PinsArgs {
     pub repo: Option<String>,
     #[arg(long, help = "Restrict pins to a cwd substring")]
     pub cwd: Option<String>,
+    #[arg(long, help = "Emit machine-readable JSON")]
+    pub json: bool,
+}
+
+#[derive(Debug, Clone, Args)]
+pub struct UnpinArgs {
+    #[arg(help = "Session id or session key to unpin")]
+    pub session_ref: String,
+    #[arg(long, help = "Pins JSON path")]
+    pub pins: Option<PathBuf>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
@@ -105,12 +116,33 @@ pub fn run_pins(args: PinsArgs) -> Result<()> {
     pins.retain(|pin| pin_matches_filters(pin, args.repo.as_deref(), args.cwd.as_deref()));
     pins.truncate(args.limit.clamp(1, 100));
 
+    if args.json {
+        print_pins_json(&pins)?;
+        return Ok(());
+    }
+
     if pins.is_empty() {
         println!("no pins");
         return Ok(());
     }
 
     print_pins(&pins);
+    Ok(())
+}
+
+pub fn run_unpin(args: UnpinArgs) -> Result<()> {
+    let pins_path = args.pins.unwrap_or(default_pins_path()?);
+    let mut pins_file = read_pins_file(&pins_path)?;
+    let Some(index) = pins_file
+        .pins
+        .iter()
+        .position(|pin| pin.session_key == args.session_ref || pin.session_id == args.session_ref)
+    else {
+        bail!("no pin matches `{}`", args.session_ref);
+    };
+    let removed = pins_file.pins.remove(index);
+    write_pins_file(&pins_path, &pins_file)?;
+    println!("unpinned {}  {}", removed.session_id, removed.session_key);
     Ok(())
 }
 
@@ -203,4 +235,33 @@ fn print_pins(pins: &[PinRecord]) {
             shell_quote(&pin.session_key)
         );
     }
+}
+
+fn print_pins_json(pins: &[PinRecord]) -> Result<()> {
+    let values = pins
+        .iter()
+        .map(|pin| {
+            json!({
+                "session_key": pin.session_key,
+                "session_id": pin.session_id,
+                "label": pin.label,
+                "repo": pin.repo,
+                "repos": pin.repos,
+                "cwd": pin.cwd,
+                "source_file_path": pin.source_file_path,
+                "created_at": pin.created_at,
+                "updated_at": pin.updated_at,
+                "show_command": format!(
+                    "codex-recall show {} --limit 120",
+                    shell_quote(&pin.session_key)
+                ),
+            })
+        })
+        .collect::<Vec<_>>();
+    let value = json!({
+        "count": values.len(),
+        "pins": values,
+    });
+    println!("{}", serde_json::to_string_pretty(&value)?);
+    Ok(())
 }

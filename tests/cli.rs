@@ -1096,3 +1096,131 @@ fn pins_filter_by_command_cwd_repo_membership() {
     assert!(stdout.contains("mixed repo"), "{stdout}");
     assert!(stdout.contains("codex-recall"), "{stdout}");
 }
+
+#[test]
+fn pins_json_outputs_machine_readable_pin_records() {
+    let temp = temp_dir("pins-json");
+    let source = temp.join("sessions");
+    let db = temp.join("index.sqlite");
+    let pins = temp.join("pins.json");
+    write_session_file(
+        &source,
+        "watcher.jsonl",
+        "watcher-session",
+        "/Users/me/projects/codex-recall",
+        "2026-04-13T02:00:00Z",
+        "LaunchAgent watcher freshness decision.",
+    );
+
+    let index = Command::new(env!("CARGO_BIN_EXE_codex-recall"))
+        .args(["index", "--db"])
+        .arg(&db)
+        .args(["--source"])
+        .arg(&source)
+        .output()
+        .unwrap();
+    assert!(index.status.success());
+
+    let search = Command::new(env!("CARGO_BIN_EXE_codex-recall"))
+        .args(["search", "watcher freshness", "--json", "--db"])
+        .arg(&db)
+        .output()
+        .unwrap();
+    assert!(search.status.success());
+    let json: serde_json::Value = serde_json::from_slice(&search.stdout).unwrap();
+    let session_key = json["results"][0]["session_key"].as_str().unwrap();
+
+    let pin = Command::new(env!("CARGO_BIN_EXE_codex-recall"))
+        .args(["pin", session_key, "--label", "watcher design", "--db"])
+        .arg(&db)
+        .args(["--pins"])
+        .arg(&pins)
+        .output()
+        .unwrap();
+    assert!(pin.status.success());
+
+    let pins_output = Command::new(env!("CARGO_BIN_EXE_codex-recall"))
+        .args(["pins", "--repo", "codex-recall", "--json", "--pins"])
+        .arg(&pins)
+        .output()
+        .unwrap();
+    assert!(
+        pins_output.status.success(),
+        "pins failed: {}",
+        String::from_utf8_lossy(&pins_output.stderr)
+    );
+
+    let json: serde_json::Value = serde_json::from_slice(&pins_output.stdout).unwrap();
+    assert_eq!(json["count"], 1);
+    assert_eq!(json["pins"][0]["label"], "watcher design");
+    assert_eq!(json["pins"][0]["session_id"], "watcher-session");
+    assert_eq!(
+        json["pins"][0]["show_command"],
+        format!("codex-recall show '{session_key}' --limit 120")
+    );
+}
+
+#[test]
+fn unpin_removes_existing_pin() {
+    let temp = temp_dir("unpin");
+    let source = temp.join("sessions");
+    let db = temp.join("index.sqlite");
+    let pins = temp.join("pins.json");
+    write_session_file(
+        &source,
+        "watcher.jsonl",
+        "watcher-session",
+        "/Users/me/projects/codex-recall",
+        "2026-04-13T02:00:00Z",
+        "LaunchAgent watcher freshness decision.",
+    );
+
+    let index = Command::new(env!("CARGO_BIN_EXE_codex-recall"))
+        .args(["index", "--db"])
+        .arg(&db)
+        .args(["--source"])
+        .arg(&source)
+        .output()
+        .unwrap();
+    assert!(index.status.success());
+
+    let search = Command::new(env!("CARGO_BIN_EXE_codex-recall"))
+        .args(["search", "watcher freshness", "--json", "--db"])
+        .arg(&db)
+        .output()
+        .unwrap();
+    assert!(search.status.success());
+    let json: serde_json::Value = serde_json::from_slice(&search.stdout).unwrap();
+    let session_key = json["results"][0]["session_key"].as_str().unwrap();
+
+    let pin = Command::new(env!("CARGO_BIN_EXE_codex-recall"))
+        .args(["pin", session_key, "--label", "watcher design", "--db"])
+        .arg(&db)
+        .args(["--pins"])
+        .arg(&pins)
+        .output()
+        .unwrap();
+    assert!(pin.status.success());
+
+    let unpin = Command::new(env!("CARGO_BIN_EXE_codex-recall"))
+        .args(["unpin", session_key, "--pins"])
+        .arg(&pins)
+        .output()
+        .unwrap();
+    assert!(
+        unpin.status.success(),
+        "unpin failed: {}",
+        String::from_utf8_lossy(&unpin.stderr)
+    );
+    assert!(String::from_utf8_lossy(&unpin.stdout).contains("unpinned watcher-session"));
+
+    let pins_output = Command::new(env!("CARGO_BIN_EXE_codex-recall"))
+        .args(["pins", "--json", "--pins"])
+        .arg(&pins)
+        .output()
+        .unwrap();
+    assert!(pins_output.status.success());
+    let json: serde_json::Value = serde_json::from_slice(&pins_output.stdout).unwrap();
+    assert_eq!(json["count"], 0);
+    assert_eq!(json["pins"].as_array().unwrap().len(), 0);
+}

@@ -33,6 +33,8 @@ codex-recall bundle "Stripe webhook" --repo palabruno --since 14d
 codex-recall show <session-id-or-session-key>
 codex-recall pin <session-key> --label "watcher design"
 codex-recall pins --repo codex-recall
+codex-recall pins --repo codex-recall --json
+codex-recall unpin <session-key>
 codex-recall doctor --json
 codex-recall stats
 ```
@@ -49,6 +51,7 @@ codex-recall search "source-map" --all-repos
 codex-recall recent --limit 10
 codex-recall show <session-key> --limit 20
 codex-recall pin <session-key> --label "canonical decision" --pins /tmp/pins.json
+codex-recall unpin <session-key> --pins /tmp/pins.json
 ```
 
 ## Behavior
@@ -126,6 +129,8 @@ Use `pin` after finding a high-value session that should be easy to return to:
 ```bash
 codex-recall pin <session-key> --label "watcher freshness design"
 codex-recall pins --repo codex-recall
+codex-recall pins --repo codex-recall --json
+codex-recall unpin <session-key>
 ```
 
 ## Agent Workflow
@@ -141,7 +146,9 @@ When an agent needs prior-session context:
 7. Use `codex-recall search "<query>" --json` when programmatic filtering is needed.
 8. Use `codex-recall show <session_key>` only for sessions that look relevant from `bundle`, `search`, or `recent`.
 9. Use `codex-recall pin <session_key> --label "<why this matters>"` for canonical decisions or sessions that are likely to be reused.
-10. Treat transcript evidence as historical. Verify against the current repo before acting.
+10. Use `codex-recall pins --json` when scripts or agents need stable pin data.
+11. Use `codex-recall unpin <session_key>` when a memory anchor is stale or mistaken.
+12. Treat transcript evidence as historical. Verify against the current repo before acting.
 
 ## Local Verification
 

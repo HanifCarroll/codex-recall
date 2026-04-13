@@ -1,6 +1,6 @@
 use crate::commands::doctor::{run_doctor, run_stats, DoctorArgs, StatsArgs};
 use crate::commands::index::{run_index, run_rebuild, IndexArgs, RebuildArgs};
-use crate::commands::pins::{run_pin, run_pins, PinArgs, PinsArgs};
+use crate::commands::pins::{run_pin, run_pins, run_unpin, PinArgs, PinsArgs, UnpinArgs};
 use crate::commands::recent::{run_recent, RecentArgs};
 use crate::commands::search::{run_bundle, run_search, run_show, BundleArgs, SearchArgs, ShowArgs};
 use crate::commands::watch::{run_status, run_watch, StatusArgs, WatchArgs};
@@ -39,6 +39,8 @@ enum Command {
     Pin(PinArgs),
     /// List pinned session anchors.
     Pins(PinsArgs),
+    /// Remove a pinned session anchor.
+    Unpin(UnpinArgs),
     /// Check database health, FTS integrity, and source paths.
     Doctor(DoctorArgs),
     /// Print database counts.
@@ -58,6 +60,7 @@ pub fn run(args: impl IntoIterator<Item = String>) -> Result<()> {
         Some(Command::Show(args)) => run_show(args),
         Some(Command::Pin(args)) => run_pin(args),
         Some(Command::Pins(args)) => run_pins(args),
+        Some(Command::Unpin(args)) => run_unpin(args),
         Some(Command::Doctor(args)) => run_doctor(args),
         Some(Command::Stats(args)) => run_stats(args),
         None => {
