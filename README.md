@@ -18,6 +18,8 @@ Raw JSONL files remain the source of truth.
 ```bash
 codex-recall index
 codex-recall search "Stripe webhook"
+codex-recall search "Stripe webhook" --repo palabruno --since 2026-04-01
+codex-recall search "Stripe webhook" --cwd projects/palabruno
 codex-recall search "Stripe webhook" --json
 codex-recall show <session-id>
 codex-recall stats
@@ -38,8 +40,12 @@ codex-recall show <session-id> --limit 20
 - Deduplicates exact duplicate transcript events.
 - Keeps exact source provenance as `path:line`.
 - Uses SQLite FTS5 with safe query normalization, so punctuation-heavy queries like `source-map` work.
+- Falls back to matching any query term when no single event contains every term.
+- Supports search filters by derived repo slug, cwd substring, and session start date.
 - Tracks file size and mtime so repeat indexing skips unchanged sessions.
+- Reports progress to stderr every 100 scanned files during indexing.
 - Groups text search output by session, with the best receipts under each session.
+- Reports source-file counts and duplicate source-file counts in `stats`.
 - Keeps `--json` output compact by returning `text_preview` instead of full transcript blobs.
 
 ## Local Verification

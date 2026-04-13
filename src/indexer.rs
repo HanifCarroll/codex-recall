@@ -14,6 +14,17 @@ pub struct IndexReport {
 }
 
 pub fn index_sources(store: &Store, sources: &[PathBuf]) -> Result<IndexReport> {
+    index_sources_with_progress(store, sources, |_| {})
+}
+
+pub fn index_sources_with_progress<F>(
+    store: &Store,
+    sources: &[PathBuf],
+    mut on_progress: F,
+) -> Result<IndexReport>
+where
+    F: FnMut(&IndexReport),
+{
     let mut report = IndexReport {
         files_seen: 0,
         files_skipped: 0,
@@ -24,6 +35,9 @@ pub fn index_sources(store: &Store, sources: &[PathBuf]) -> Result<IndexReport> 
     for source in sources {
         for path in jsonl_files(source)? {
             report.files_seen += 1;
+            if report.files_seen % 100 == 0 {
+                on_progress(&report);
+            }
             let file_state = FileState::from_path(&path)?;
             if store.is_source_current(
                 &path,

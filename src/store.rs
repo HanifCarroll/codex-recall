@@ -11,11 +11,14 @@ pub struct Store {
 pub struct Stats {
     pub session_count: u64,
     pub event_count: u64,
+    pub source_file_count: u64,
+    pub duplicate_source_file_count: u64,
 }
 
 #[derive(Debug, Clone, PartialEq)]
 pub struct SearchResult {
     pub session_id: String,
+    pub repo: String,
     pub kind: EventKind,
     pub text: String,
     pub snippet: String,
@@ -24,6 +27,27 @@ pub struct SearchResult {
     pub source_file_path: PathBuf,
     pub source_line_number: usize,
     pub source_timestamp: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SearchOptions {
+    pub query: String,
+    pub limit: usize,
+    pub repo: Option<String>,
+    pub cwd: Option<String>,
+    pub since: Option<String>,
+}
+
+impl SearchOptions {
+    pub fn new(query: impl Into<String>, limit: usize) -> Self {
+        Self {
+            query: query.into(),
+            limit,
+            repo: None,
+            cwd: None,
+            since: None,
+        }
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -77,24 +101,55 @@ impl Store {
             .query_row("SELECT COUNT(*) FROM events", [], |row| {
                 row.get::<_, u64>(0)
             })?;
+        let source_file_count =
+            self.conn
+                .query_row("SELECT COUNT(*) FROM ingestion_state", [], |row| {
+                    row.get::<_, u64>(0)
+                })?;
+        let unique_ingested_sessions = self.conn.query_row(
+            "SELECT COUNT(DISTINCT session_id) FROM ingestion_state WHERE session_id IS NOT NULL",
+            [],
+            |row| row.get::<_, u64>(0),
+        )?;
 
         Ok(Stats {
             session_count,
             event_count,
+            source_file_count,
+            duplicate_source_file_count: source_file_count.saturating_sub(unique_ingested_sessions),
         })
     }
 
     pub fn search(&self, query: &str, limit: usize) -> Result<Vec<SearchResult>> {
-        let query = normalize_fts_query(query);
-        if query.is_empty() {
+        self.search_with_options(SearchOptions::new(query, limit))
+    }
+
+    pub fn search_with_options(&self, options: SearchOptions) -> Result<Vec<SearchResult>> {
+        let terms = fts_terms(&options.query);
+        if terms.is_empty() {
             return Ok(Vec::new());
         }
 
-        let limit = limit.max(1).min(100);
+        let limit = options.limit.max(1).min(100);
+        let results = self.search_with_fts_query(&options, &and_fts_query(&terms), limit)?;
+        if !results.is_empty() || terms.len() == 1 {
+            return Ok(results);
+        }
+
+        self.search_with_fts_query(&options, &or_fts_query(&terms), limit)
+    }
+
+    fn search_with_fts_query(
+        &self,
+        options: &SearchOptions,
+        fts_query: &str,
+        limit: usize,
+    ) -> Result<Vec<SearchResult>> {
         let mut statement = self.conn.prepare(
             r#"
             SELECT
                 events.session_id,
+                sessions.repo,
                 events.kind,
                 events.text,
                 snippet(events_fts, 3, '', '', ' ... ', 16) AS snippet,
@@ -107,35 +162,54 @@ impl Store {
             JOIN events ON events.id = events_fts.event_id
             JOIN sessions ON sessions.session_id = events.session_id
             WHERE events_fts MATCH ?
+              AND (? IS NULL OR lower(sessions.repo) = lower(?))
+              AND (? IS NULL OR sessions.cwd LIKE '%' || ? || '%')
+              AND (
+                ? IS NULL OR
+                datetime(replace(replace(sessions.session_timestamp, 'T', ' '), 'Z', '')) >= datetime(?)
+              )
             ORDER BY score ASC, events.source_line_number ASC
             LIMIT ?
             "#,
         )?;
 
-        let rows = statement.query_map(params![query, limit as i64], |row| {
-            let kind_text: String = row.get(1)?;
-            let kind = EventKind::from_str(&kind_text).ok_or_else(|| {
-                rusqlite::Error::InvalidColumnType(
-                    1,
-                    "kind".to_owned(),
-                    rusqlite::types::Type::Text,
-                )
-            })?;
-            let source_file_path: String = row.get(6)?;
-            let source_line_number: i64 = row.get(7)?;
+        let rows = statement.query_map(
+            params![
+                fts_query,
+                options.repo,
+                options.repo,
+                options.cwd,
+                options.cwd,
+                options.since,
+                options.since,
+                limit as i64
+            ],
+            |row| {
+                let kind_text: String = row.get(2)?;
+                let kind = EventKind::from_str(&kind_text).ok_or_else(|| {
+                    rusqlite::Error::InvalidColumnType(
+                        2,
+                        "kind".to_owned(),
+                        rusqlite::types::Type::Text,
+                    )
+                })?;
+                let source_file_path: String = row.get(7)?;
+                let source_line_number: i64 = row.get(8)?;
 
-            Ok(SearchResult {
-                session_id: row.get(0)?,
-                kind,
-                text: row.get(2)?,
-                snippet: row.get(3)?,
-                score: row.get(4)?,
-                cwd: row.get(5)?,
-                source_file_path: PathBuf::from(source_file_path),
-                source_line_number: source_line_number as usize,
-                source_timestamp: row.get(8)?,
-            })
-        })?;
+                Ok(SearchResult {
+                    session_id: row.get(0)?,
+                    repo: row.get(1)?,
+                    kind,
+                    text: row.get(3)?,
+                    snippet: row.get(4)?,
+                    score: row.get(5)?,
+                    cwd: row.get(6)?,
+                    source_file_path: PathBuf::from(source_file_path),
+                    source_line_number: source_line_number as usize,
+                    source_timestamp: row.get(9)?,
+                })
+            },
+        )?;
 
         rows.collect::<std::result::Result<Vec<_>, _>>()
             .map_err(Into::into)
@@ -250,6 +324,7 @@ impl Store {
                 session_id TEXT PRIMARY KEY,
                 session_timestamp TEXT NOT NULL,
                 cwd TEXT NOT NULL,
+                repo TEXT NOT NULL DEFAULT '',
                 cli_version TEXT,
                 source_file_path TEXT NOT NULL
             );
@@ -289,18 +364,22 @@ impl Store {
             );
             "#,
         )?;
+        self.ensure_sessions_repo_column()?;
+        self.backfill_session_repos()?;
         Ok(())
     }
 
     fn index_session_inner(&self, parsed: &ParsedSession) -> Result<()> {
+        let repo = repo_slug(&parsed.session.cwd);
         self.conn.execute(
             r#"
             INSERT INTO sessions (
-                session_id, session_timestamp, cwd, cli_version, source_file_path
-            ) VALUES (?, ?, ?, ?, ?)
+                session_id, session_timestamp, cwd, repo, cli_version, source_file_path
+            ) VALUES (?, ?, ?, ?, ?, ?)
             ON CONFLICT(session_id) DO UPDATE SET
                 session_timestamp = excluded.session_timestamp,
                 cwd = excluded.cwd,
+                repo = excluded.repo,
                 cli_version = excluded.cli_version,
                 source_file_path = excluded.source_file_path
             "#,
@@ -308,6 +387,7 @@ impl Store {
                 parsed.session.id,
                 parsed.session.timestamp,
                 parsed.session.cwd,
+                repo,
                 parsed.session.cli_version,
                 parsed.session.source_file_path.display().to_string(),
             ],
@@ -352,9 +432,45 @@ impl Store {
 
         Ok(())
     }
+
+    fn ensure_sessions_repo_column(&self) -> Result<()> {
+        let has_repo = self
+            .conn
+            .prepare("PRAGMA table_info(sessions)")?
+            .query_map([], |row| row.get::<_, String>(1))?
+            .collect::<std::result::Result<Vec<_>, _>>()?
+            .iter()
+            .any(|column| column == "repo");
+
+        if !has_repo {
+            self.conn.execute(
+                "ALTER TABLE sessions ADD COLUMN repo TEXT NOT NULL DEFAULT ''",
+                [],
+            )?;
+        }
+        Ok(())
+    }
+
+    fn backfill_session_repos(&self) -> Result<()> {
+        let mut statement = self
+            .conn
+            .prepare("SELECT session_id, cwd FROM sessions WHERE repo = ''")?;
+        let rows = statement.query_map([], |row| {
+            Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
+        })?;
+
+        for row in rows {
+            let (session_id, cwd) = row?;
+            self.conn.execute(
+                "UPDATE sessions SET repo = ? WHERE session_id = ?",
+                params![repo_slug(&cwd), session_id],
+            )?;
+        }
+        Ok(())
+    }
 }
 
-fn normalize_fts_query(query: &str) -> String {
+fn fts_terms(query: &str) -> Vec<String> {
     let mut terms = Vec::new();
     let mut current = String::new();
 
@@ -371,10 +487,34 @@ fn normalize_fts_query(query: &str) -> String {
     }
 
     terms
-        .into_iter()
-        .map(|term| format!("\"{}\"", term.replace('"', "\"\"")))
+}
+
+fn quote_fts_term(term: &str) -> String {
+    format!("\"{}\"", term.replace('"', "\"\""))
+}
+
+fn and_fts_query(terms: &[String]) -> String {
+    terms
+        .iter()
+        .map(|term| quote_fts_term(term))
         .collect::<Vec<_>>()
         .join(" AND ")
+}
+
+fn or_fts_query(terms: &[String]) -> String {
+    terms
+        .into_iter()
+        .map(|term| quote_fts_term(term))
+        .collect::<Vec<_>>()
+        .join(" OR ")
+}
+
+fn repo_slug(cwd: &str) -> String {
+    Path::new(cwd)
+        .file_name()
+        .and_then(|name| name.to_str())
+        .unwrap_or(cwd)
+        .to_owned()
 }
 
 #[cfg(test)]
@@ -394,12 +534,26 @@ mod tests {
     }
 
     fn sample_session() -> ParsedSession {
-        let source = PathBuf::from("/tmp/session.jsonl");
+        sample_session_with(
+            "session-1",
+            "/Users/me/project",
+            "2026-04-13T01:00:00Z",
+            "/tmp/session.jsonl",
+        )
+    }
+
+    fn sample_session_with(
+        id: &str,
+        cwd: &str,
+        timestamp: &str,
+        source_path: &str,
+    ) -> ParsedSession {
+        let source = PathBuf::from(source_path);
         ParsedSession {
             session: SessionMetadata {
-                id: "session-1".to_owned(),
-                timestamp: "2026-04-13T01:00:00Z".to_owned(),
-                cwd: "/Users/me/project".to_owned(),
+                id: id.to_owned(),
+                timestamp: timestamp.to_owned(),
+                cwd: cwd.to_owned(),
                 cli_version: Some("0.1.0".to_owned()),
                 source_file_path: source.clone(),
             },
@@ -459,6 +613,60 @@ mod tests {
         assert_eq!(results[0].cwd, "/Users/me/project");
         assert!(results[0].snippet.contains("webhook"));
         assert!(results[0].score < 0.0);
+    }
+
+    #[test]
+    fn filters_search_by_repo_cwd_and_since() {
+        let store = Store::open(temp_db_path("filters")).unwrap();
+        store
+            .index_session(&sample_session_with(
+                "old-palabruno",
+                "/Users/me/projects/palabruno",
+                "2026-04-01T01:00:00Z",
+                "/tmp/old.jsonl",
+            ))
+            .unwrap();
+        store
+            .index_session(&sample_session_with(
+                "new-palabruno",
+                "/Users/me/projects/palabruno",
+                "2026-04-13T01:00:00Z",
+                "/tmp/new.jsonl",
+            ))
+            .unwrap();
+        store
+            .index_session(&sample_session_with(
+                "genrupt",
+                "/Users/me/projects/Genrupt",
+                "2026-04-13T01:00:00Z",
+                "/tmp/genrupt.jsonl",
+            ))
+            .unwrap();
+
+        let results = store
+            .search_with_options(SearchOptions {
+                query: "webhook secret".to_owned(),
+                limit: 10,
+                repo: Some("palabruno".to_owned()),
+                cwd: Some("projects/palabruno".to_owned()),
+                since: Some("2026-04-10".to_owned()),
+            })
+            .unwrap();
+
+        assert_eq!(results.len(), 1);
+        assert_eq!(results[0].session_id, "new-palabruno");
+        assert_eq!(results[0].repo, "palabruno");
+    }
+
+    #[test]
+    fn falls_back_to_any_query_term_when_all_terms_match_no_single_event() {
+        let store = Store::open(temp_db_path("fallback")).unwrap();
+        store.index_session(&sample_session()).unwrap();
+
+        let results = store.search("RevenueCat missing", 5).unwrap();
+
+        assert!(!results.is_empty());
+        assert_eq!(results[0].session_id, "session-1");
     }
 
     #[test]

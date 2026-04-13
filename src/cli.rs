@@ -1,6 +1,6 @@
 use crate::config::{default_db_path, default_source_roots};
-use crate::indexer::index_sources;
-use crate::store::{SearchResult, Store};
+use crate::indexer::index_sources_with_progress;
+use crate::store::{SearchOptions, SearchResult, Store};
 use anyhow::{anyhow, bail, Context, Result};
 use serde_json::json;
 use std::ffi::OsString;
@@ -103,7 +103,12 @@ fn run_index(args: Vec<String>) -> Result<()> {
     }
 
     let store = Store::open(&db_path)?;
-    let report = index_sources(&store, &sources)?;
+    let report = index_sources_with_progress(&store, &sources, |report| {
+        eprintln!(
+            "scanned {} files, indexed {} session files, skipped {}",
+            report.files_seen, report.sessions_indexed, report.files_skipped
+        );
+    })?;
     println!(
         "indexed {} session files, {} events from {} files ({} skipped) into {}",
         report.sessions_indexed,
@@ -124,6 +129,9 @@ fn run_search(args: Vec<String>) -> Result<()> {
     let mut db_path = default_db_path()?;
     let mut limit = 10usize;
     let mut json_output = false;
+    let mut repo = None;
+    let mut cwd = None;
+    let mut since = None;
     let mut index = 1;
 
     while index < args.len() {
@@ -144,6 +152,18 @@ fn run_search(args: Vec<String>) -> Result<()> {
                     .parse()
                     .with_context(|| format!("parse --limit value `{raw}`"))?;
             }
+            "--repo" => {
+                index += 1;
+                repo = Some(required_value(&args, index, "--repo")?.to_owned());
+            }
+            "--cwd" => {
+                index += 1;
+                cwd = Some(required_value(&args, index, "--cwd")?.to_owned());
+            }
+            "--since" => {
+                index += 1;
+                since = Some(required_value(&args, index, "--since")?.to_owned());
+            }
             flag => bail!("unknown search flag `{flag}`"),
         }
         index += 1;
@@ -155,7 +175,13 @@ fn run_search(args: Vec<String>) -> Result<()> {
     } else {
         limit.saturating_mul(5)
     };
-    let results = store.search(&query, search_limit)?;
+    let results = store.search_with_options(SearchOptions {
+        query: query.clone(),
+        limit: search_limit,
+        repo,
+        cwd,
+        since,
+    })?;
     if json_output {
         print_search_json(&query, &results)?;
         return Ok(());
@@ -187,17 +213,23 @@ fn run_stats(args: Vec<String>) -> Result<()> {
 
     let stats = Store::open(db_path)?.stats()?;
     println!(
-        "{} sessions, {} events",
-        stats.session_count, stats.event_count
+        "{} sessions, {} events, {} source files, {} duplicate source files",
+        stats.session_count,
+        stats.event_count,
+        stats.source_file_count,
+        stats.duplicate_source_file_count
     );
     Ok(())
 }
 
 fn required_path(args: &[String], index: usize, flag: &str) -> Result<PathBuf> {
-    let value = args
-        .get(index)
-        .ok_or_else(|| anyhow!("{flag} requires a path"))?;
-    Ok(PathBuf::from(value))
+    Ok(PathBuf::from(required_value(args, index, flag)?))
+}
+
+fn required_value<'a>(args: &'a [String], index: usize, flag: &str) -> Result<&'a str> {
+    args.get(index)
+        .map(String::as_str)
+        .ok_or_else(|| anyhow!("{flag} requires a value"))
 }
 
 fn compact_whitespace(value: &str) -> String {
@@ -263,6 +295,7 @@ fn print_search_json(query: &str, results: &[SearchResult]) -> Result<()> {
             );
             json!({
                 "session_id": result.session_id,
+                "repo": result.repo,
                 "kind": result.kind.as_str(),
                 "cwd": result.cwd,
                 "source_file_path": result.source_file_path,
@@ -287,7 +320,7 @@ fn print_search_json(query: &str, results: &[SearchResult]) -> Result<()> {
 
 fn print_help() {
     println!(
-        "codex-recall\n\nCommands:\n  index [--db PATH] [--source PATH ...]\n  search QUERY [--db PATH] [--limit N] [--json]\n  show SESSION_ID [--db PATH] [--limit N]\n  stats [--db PATH]"
+        "codex-recall\n\nCommands:\n  index [--db PATH] [--source PATH ...]\n  search QUERY [--db PATH] [--limit N] [--repo NAME] [--cwd PATH_PART] [--since DATE] [--json]\n  show SESSION_ID [--db PATH] [--limit N]\n  stats [--db PATH]"
     );
 }
 

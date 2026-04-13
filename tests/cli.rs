@@ -26,6 +26,37 @@ fn write_sample_session(root: &std::path::Path) {
     .unwrap();
 }
 
+fn write_session(root: &std::path::Path, id: &str, cwd: &str, timestamp: &str) {
+    let session_dir = root.join("2026/04/13");
+    fs::create_dir_all(&session_dir).unwrap();
+    fs::write(
+        session_dir.join(format!("{id}.jsonl")),
+        format!(
+            r#"{{"timestamp":"{timestamp}","type":"session_meta","payload":{{"id":"{id}","timestamp":"{timestamp}","cwd":"{cwd}","cli_version":"0.1.0"}}}}
+{{"timestamp":"{timestamp}","type":"event_msg","payload":{{"type":"agent_message","message":"The production webhook secret was missing."}}}}
+"#
+        ),
+    )
+    .unwrap();
+}
+
+fn write_many_sessions(root: &std::path::Path, count: usize) {
+    let session_dir = root.join("2026/04/13");
+    fs::create_dir_all(&session_dir).unwrap();
+    for index in 0..count {
+        let id = format!("session-{index}");
+        fs::write(
+            session_dir.join(format!("{id}.jsonl")),
+            format!(
+                r#"{{"timestamp":"2026-04-13T01:00:00Z","type":"session_meta","payload":{{"id":"{id}","timestamp":"2026-04-13T01:00:00Z","cwd":"/tmp/project"}}}}
+{{"timestamp":"2026-04-13T01:00:01Z","type":"event_msg","payload":{{"type":"user_message","message":"Need progress output {index}"}}}}
+"#
+            ),
+        )
+        .unwrap();
+    }
+}
+
 #[test]
 fn index_then_search_outputs_ranked_receipts() {
     let temp = temp_dir("index-search");
@@ -142,4 +173,84 @@ fn show_prints_session_events_with_line_receipts() {
     assert!(stdout.contains("Debug RevenueCat Stripe webhook"));
     assert!(stdout.contains("assistant_message"));
     assert!(stdout.contains(":3"));
+}
+
+#[test]
+fn search_filters_by_repo_cwd_and_since_flags() {
+    let temp = temp_dir("search-filters");
+    let source = temp.join("sessions");
+    let db = temp.join("index.sqlite");
+    write_session(
+        &source,
+        "old-palabruno",
+        "/Users/me/projects/palabruno",
+        "2026-04-01T01:00:00Z",
+    );
+    write_session(
+        &source,
+        "new-palabruno",
+        "/Users/me/projects/palabruno",
+        "2026-04-13T01:00:00Z",
+    );
+    write_session(
+        &source,
+        "genrupt",
+        "/Users/me/projects/Genrupt",
+        "2026-04-13T01:00:00Z",
+    );
+
+    let index = Command::new(env!("CARGO_BIN_EXE_codex-recall"))
+        .args(["index", "--db"])
+        .arg(&db)
+        .args(["--source"])
+        .arg(&source)
+        .output()
+        .unwrap();
+    assert!(index.status.success());
+
+    let search = Command::new(env!("CARGO_BIN_EXE_codex-recall"))
+        .args([
+            "search",
+            "webhook secret",
+            "--repo",
+            "palabruno",
+            "--cwd",
+            "projects/palabruno",
+            "--since",
+            "2026-04-10",
+            "--db",
+        ])
+        .arg(&db)
+        .output()
+        .unwrap();
+    assert!(
+        search.status.success(),
+        "search failed: {}",
+        String::from_utf8_lossy(&search.stderr)
+    );
+
+    let stdout = String::from_utf8_lossy(&search.stdout);
+    assert!(stdout.contains("new-palabruno"));
+    assert!(!stdout.contains("old-palabruno"));
+    assert!(!stdout.contains("genrupt"));
+}
+
+#[test]
+fn index_reports_progress_for_larger_sources() {
+    let temp = temp_dir("progress");
+    let source = temp.join("sessions");
+    let db = temp.join("index.sqlite");
+    write_many_sessions(&source, 101);
+
+    let index = Command::new(env!("CARGO_BIN_EXE_codex-recall"))
+        .args(["index", "--db"])
+        .arg(&db)
+        .args(["--source"])
+        .arg(&source)
+        .output()
+        .unwrap();
+    assert!(index.status.success());
+
+    let stderr = String::from_utf8_lossy(&index.stderr);
+    assert!(stderr.contains("scanned 100 files"));
 }
