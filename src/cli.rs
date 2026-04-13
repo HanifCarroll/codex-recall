@@ -1,7 +1,8 @@
 use crate::config::{default_db_path, default_source_roots};
 use crate::indexer::index_sources;
-use crate::store::Store;
+use crate::store::{SearchResult, Store};
 use anyhow::{anyhow, bail, Context, Result};
+use serde_json::json;
 use std::ffi::OsString;
 use std::path::PathBuf;
 
@@ -68,10 +69,14 @@ fn run_search(args: Vec<String>) -> Result<()> {
     let query = args[0].clone();
     let mut db_path = default_db_path()?;
     let mut limit = 10usize;
+    let mut json_output = false;
     let mut index = 1;
 
     while index < args.len() {
         match args[index].as_str() {
+            "--json" => {
+                json_output = true;
+            }
             "--db" => {
                 index += 1;
                 db_path = required_path(&args, index, "--db")?;
@@ -92,6 +97,11 @@ fn run_search(args: Vec<String>) -> Result<()> {
 
     let store = Store::open(&db_path)?;
     let results = store.search(&query, limit)?;
+    if json_output {
+        print_search_json(&query, &results)?;
+        return Ok(());
+    }
+
     if results.is_empty() {
         println!("no matches");
         return Ok(());
@@ -149,9 +159,42 @@ fn compact_whitespace(value: &str) -> String {
     value.split_whitespace().collect::<Vec<_>>().join(" ")
 }
 
+fn print_search_json(query: &str, results: &[SearchResult]) -> Result<()> {
+    let results = results
+        .iter()
+        .map(|result| {
+            let source = format!(
+                "{}:{}",
+                result.source_file_path.display(),
+                result.source_line_number
+            );
+            json!({
+                "session_id": result.session_id,
+                "kind": result.kind.as_str(),
+                "cwd": result.cwd,
+                "source_file_path": result.source_file_path,
+                "source_line_number": result.source_line_number,
+                "source": source,
+                "source_timestamp": result.source_timestamp,
+                "score": result.score,
+                "snippet": compact_whitespace(&result.snippet),
+                "text": result.text,
+            })
+        })
+        .collect::<Vec<_>>();
+
+    let value = json!({
+        "query": query,
+        "count": results.len(),
+        "results": results,
+    });
+    println!("{}", serde_json::to_string_pretty(&value)?);
+    Ok(())
+}
+
 fn print_help() {
     println!(
-        "codex-recall\n\nCommands:\n  index [--db PATH] [--source PATH ...]\n  search QUERY [--db PATH] [--limit N]\n  stats [--db PATH]"
+        "codex-recall\n\nCommands:\n  index [--db PATH] [--source PATH ...]\n  search QUERY [--db PATH] [--limit N] [--json]\n  stats [--db PATH]"
     );
 }
 

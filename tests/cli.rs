@@ -64,3 +64,41 @@ fn index_then_search_outputs_ranked_receipts() {
     assert!(stdout.contains(":3"));
     assert!(stdout.contains("production webhook secret"));
 }
+
+#[test]
+fn search_json_outputs_machine_readable_receipts() {
+    let temp = temp_dir("search-json");
+    let source = temp.join("sessions");
+    let db = temp.join("index.sqlite");
+    write_sample_session(&source);
+
+    let index = Command::new(env!("CARGO_BIN_EXE_codex-recall"))
+        .args(["index", "--db"])
+        .arg(&db)
+        .args(["--source"])
+        .arg(&source)
+        .output()
+        .unwrap();
+    assert!(index.status.success());
+
+    let search = Command::new(env!("CARGO_BIN_EXE_codex-recall"))
+        .args(["search", "webhook secret", "--json", "--db"])
+        .arg(&db)
+        .output()
+        .unwrap();
+    assert!(
+        search.status.success(),
+        "search failed: {}",
+        String::from_utf8_lossy(&search.stderr)
+    );
+
+    let json: serde_json::Value = serde_json::from_slice(&search.stdout).unwrap();
+    assert_eq!(json["query"], "webhook secret");
+    assert_eq!(json["results"][0]["session_id"], "session-1");
+    assert_eq!(json["results"][0]["source_line_number"], 3);
+    assert_eq!(json["results"][0]["kind"], "assistant_message");
+    assert!(json["results"][0]["source"]
+        .as_str()
+        .unwrap()
+        .contains(":3"));
+}
