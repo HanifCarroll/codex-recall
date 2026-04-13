@@ -1,5 +1,5 @@
 use crate::parser::parse_session_file;
-use crate::store::Store;
+use crate::store::{build_session_key, Store};
 use anyhow::{Context, Result};
 use std::fs;
 use std::path::{Path, PathBuf};
@@ -49,6 +49,8 @@ where
             }
 
             if let Some(parsed) = parse_session_file(&path)? {
+                let session_key =
+                    build_session_key(&parsed.session.id, &parsed.session.source_file_path);
                 report.events_indexed += parsed.events.len();
                 store.index_session(&parsed)?;
                 store.mark_source_indexed(
@@ -56,6 +58,7 @@ where
                     file_state.source_file_mtime_ns,
                     file_state.source_file_size,
                     Some(&parsed.session.id),
+                    Some(&session_key),
                 )?;
                 report.sessions_indexed += 1;
             } else {
@@ -63,6 +66,7 @@ where
                     &path,
                     file_state.source_file_mtime_ns,
                     file_state.source_file_size,
+                    None,
                     None,
                 )?;
             }

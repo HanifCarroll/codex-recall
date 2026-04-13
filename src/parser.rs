@@ -250,7 +250,8 @@ fn parse_command_event(
     source_line_number: usize,
     source_timestamp: Option<&str>,
 ) -> Option<ParsedEvent> {
-    let command = payload.get("command").and_then(Value::as_str)?.trim();
+    let command = extract_command(payload.get("command")?)?;
+    let command = command.trim();
     if command.is_empty() {
         return None;
     }
@@ -258,7 +259,12 @@ fn parse_command_event(
     let stdout = payload.get("stdout").and_then(Value::as_str).unwrap_or("");
     let stderr = payload.get("stderr").and_then(Value::as_str).unwrap_or("");
     let mut text = format!("$ {command}");
-    let output = join_command_output(stdout, stderr);
+    let output = payload
+        .get("aggregated_output")
+        .and_then(Value::as_str)
+        .filter(|value| !value.trim().is_empty())
+        .map(str::to_owned)
+        .unwrap_or_else(|| join_command_output(stdout, stderr));
     if !output.is_empty() {
         text.push('\n');
         text.push_str(&cap_text(&output, COMMAND_OUTPUT_LIMIT));
@@ -279,6 +285,24 @@ fn parse_command_event(
         source_file_path: path.to_path_buf(),
         source_line_number,
     })
+}
+
+fn extract_command(value: &Value) -> Option<String> {
+    if let Some(command) = value.as_str() {
+        return Some(command.to_owned());
+    }
+
+    let argv = value.as_array()?;
+    let args = argv.iter().filter_map(Value::as_str).collect::<Vec<_>>();
+    if args.len() >= 3 && (args[1] == "-lc" || args[1] == "-c") {
+        return Some(args[2].to_owned());
+    }
+
+    if args.is_empty() {
+        None
+    } else {
+        Some(args.join(" "))
+    }
 }
 
 fn extract_content_text(content: &Value) -> Option<String> {
@@ -410,5 +434,26 @@ mod tests {
 
         assert_eq!(parsed.events.len(), 1);
         assert_eq!(parsed.events[0].text, "What did we decide about Sentry?");
+    }
+
+    #[test]
+    fn parses_exec_command_end_with_argv_and_aggregated_output() {
+        let path = temp_jsonl(
+            "argv-command",
+            r#"{"timestamp":"2026-04-13T01:00:00Z","type":"session_meta","payload":{"id":"session-5","timestamp":"2026-04-13T01:00:00Z","cwd":"/Users/me/hanif-md"}}
+{"timestamp":"2026-04-13T01:00:01Z","type":"event_msg","payload":{"type":"exec_command_end","command":["/bin/zsh","-lc","cargo test"],"cwd":"/Users/me/projects/codex-recall","exit_code":0,"aggregated_output":"test result: ok"}}
+"#,
+        );
+
+        let parsed = parse_session_file(&path).unwrap().unwrap();
+
+        assert_eq!(parsed.events.len(), 1);
+        assert_eq!(parsed.events[0].kind, EventKind::Command);
+        assert_eq!(parsed.events[0].command.as_deref(), Some("cargo test"));
+        assert_eq!(
+            parsed.events[0].cwd.as_deref(),
+            Some("/Users/me/projects/codex-recall")
+        );
+        assert!(parsed.events[0].text.contains("test result: ok"));
     }
 }

@@ -4,7 +4,8 @@ use crate::store::{SearchOptions, SearchResult, Store};
 use anyhow::{anyhow, bail, Context, Result};
 use serde_json::json;
 use std::ffi::OsString;
-use std::path::PathBuf;
+use std::fs;
+use std::path::{Path, PathBuf};
 
 pub fn run(args: impl IntoIterator<Item = String>) -> Result<()> {
     let mut args = args.into_iter();
@@ -15,8 +16,10 @@ pub fn run(args: impl IntoIterator<Item = String>) -> Result<()> {
 
     match command.as_str() {
         "index" => run_index(args.collect()),
+        "rebuild" => run_rebuild(args.collect()),
         "search" => run_search(args.collect()),
         "show" => run_show(args.collect()),
+        "doctor" => run_doctor(args.collect()),
         "stats" => run_stats(args.collect()),
         "help" | "--help" | "-h" => {
             print_help();
@@ -31,7 +34,7 @@ fn run_show(args: Vec<String>) -> Result<()> {
         bail!("show requires a session id");
     }
 
-    let session_id = args[0].clone();
+    let session_ref = args[0].clone();
     let mut db_path = default_db_path()?;
     let mut limit = 80usize;
     let mut index = 1;
@@ -57,13 +60,35 @@ fn run_show(args: Vec<String>) -> Result<()> {
     }
 
     let store = Store::open(&db_path)?;
-    let events = store.session_events(&session_id, limit)?;
+    let matches = store.resolve_session_reference(&session_ref)?;
+    if matches.is_empty() {
+        println!("no indexed events for {session_ref}");
+        return Ok(());
+    }
+    if matches.len() > 1 {
+        let choices = matches
+            .iter()
+            .map(|session| {
+                format!(
+                    "  {}  {}  {}",
+                    session.session_key,
+                    session.cwd,
+                    session.source_file_path.display()
+                )
+            })
+            .collect::<Vec<_>>()
+            .join("\n");
+        bail!("multiple indexed sessions match `{session_ref}`; use one session_key:\n{choices}");
+    }
+
+    let session = &matches[0];
+    let events = store.session_events(&session.session_key, limit)?;
     if events.is_empty() {
-        println!("no indexed events for {session_id}");
+        println!("no indexed events for {session_ref}");
         return Ok(());
     }
 
-    println!("{session_id}");
+    println!("{}  {}", session.session_key, session.session_id);
     println!("{}", events[0].cwd);
     for event in events {
         println!(
@@ -120,6 +145,48 @@ fn run_index(args: Vec<String>) -> Result<()> {
     Ok(())
 }
 
+fn run_rebuild(args: Vec<String>) -> Result<()> {
+    let mut db_path = default_db_path()?;
+    let mut sources = Vec::new();
+    let mut index = 0;
+
+    while index < args.len() {
+        match args[index].as_str() {
+            "--db" => {
+                index += 1;
+                db_path = required_path(&args, index, "--db")?;
+            }
+            "--source" => {
+                index += 1;
+                sources.push(required_path(&args, index, "--source")?);
+            }
+            flag => bail!("unknown rebuild flag `{flag}`"),
+        }
+        index += 1;
+    }
+
+    if sources.is_empty() {
+        sources = default_source_roots()?;
+    }
+
+    remove_db_files(&db_path)?;
+    let store = Store::open(&db_path)?;
+    let report = index_sources_with_progress(&store, &sources, |report| {
+        eprintln!(
+            "scanned {} files, indexed {} session files, skipped {}",
+            report.files_seen, report.sessions_indexed, report.files_skipped
+        );
+    })?;
+    println!(
+        "rebuilt {} session files, {} events from {} files into {}",
+        report.sessions_indexed,
+        report.events_indexed,
+        report.files_seen,
+        db_path.display()
+    );
+    Ok(())
+}
+
 fn run_search(args: Vec<String>) -> Result<()> {
     if args.is_empty() {
         bail!("search requires a query");
@@ -132,6 +199,7 @@ fn run_search(args: Vec<String>) -> Result<()> {
     let mut repo = None;
     let mut cwd = None;
     let mut since = None;
+    let mut all_repos = false;
     let mut index = 1;
 
     while index < args.len() {
@@ -156,6 +224,9 @@ fn run_search(args: Vec<String>) -> Result<()> {
                 index += 1;
                 repo = Some(required_value(&args, index, "--repo")?.to_owned());
             }
+            "--all-repos" => {
+                all_repos = true;
+            }
             "--cwd" => {
                 index += 1;
                 cwd = Some(required_value(&args, index, "--cwd")?.to_owned());
@@ -170,6 +241,11 @@ fn run_search(args: Vec<String>) -> Result<()> {
     }
 
     let store = Store::open(&db_path)?;
+    let current_repo = if repo.is_none() && !all_repos {
+        detect_current_repo()
+    } else {
+        None
+    };
     let search_limit = if json_output {
         limit
     } else {
@@ -181,6 +257,7 @@ fn run_search(args: Vec<String>) -> Result<()> {
         repo,
         cwd,
         since,
+        current_repo,
     })?;
     if json_output {
         print_search_json(&query, &results)?;
@@ -194,6 +271,84 @@ fn run_search(args: Vec<String>) -> Result<()> {
 
     print_grouped_search_results(&results, limit);
 
+    Ok(())
+}
+
+fn run_doctor(args: Vec<String>) -> Result<()> {
+    let mut db_path = default_db_path()?;
+    let mut json_output = false;
+    let mut index = 0;
+
+    while index < args.len() {
+        match args[index].as_str() {
+            "--json" => json_output = true,
+            "--db" => {
+                index += 1;
+                db_path = required_path(&args, index, "--db")?;
+            }
+            flag => bail!("unknown doctor flag `{flag}`"),
+        }
+        index += 1;
+    }
+
+    let db_existed = db_path.exists();
+    let store = Store::open(&db_path)?;
+    let stats = store.stats()?;
+    let quick_check = match store.quick_check() {
+        Ok(value) => value,
+        Err(error) => format!("error: {error:#}"),
+    };
+    let fts_integrity = match store.fts_integrity_check() {
+        Ok(()) => "ok".to_owned(),
+        Err(error) => format!("error: {error:#}"),
+    };
+    let sources = default_source_roots()?;
+    let source_status = sources
+        .iter()
+        .map(|source| {
+            json!({
+                "path": source,
+                "exists": source.exists(),
+            })
+        })
+        .collect::<Vec<_>>();
+    let ok = quick_check == "ok" && fts_integrity == "ok";
+
+    if json_output {
+        let value = json!({
+            "ok": ok,
+            "db_path": db_path,
+            "db_existed": db_existed,
+            "checks": {
+                "quick_check": quick_check,
+                "fts_integrity": fts_integrity,
+            },
+            "stats": {
+                "sessions": stats.session_count,
+                "events": stats.event_count,
+                "source_files": stats.source_file_count,
+                "duplicate_source_files": stats.duplicate_source_file_count,
+            },
+            "sources": source_status,
+        });
+        println!("{}", serde_json::to_string_pretty(&value)?);
+        return Ok(());
+    }
+
+    println!("database: {}", db_path.display());
+    println!("quick_check: {quick_check}");
+    println!("fts_integrity: {fts_integrity}");
+    println!(
+        "stats: {} sessions, {} events, {} source files, {} duplicate source files",
+        stats.session_count,
+        stats.event_count,
+        stats.source_file_count,
+        stats.duplicate_source_file_count
+    );
+    for source in sources {
+        let status = if source.exists() { "exists" } else { "missing" };
+        println!("source: {} ({status})", source.display());
+    }
     Ok(())
 }
 
@@ -232,6 +387,38 @@ fn required_value<'a>(args: &'a [String], index: usize, flag: &str) -> Result<&'
         .ok_or_else(|| anyhow!("{flag} requires a value"))
 }
 
+fn remove_db_files(db_path: &Path) -> Result<()> {
+    for path in [
+        db_path.to_path_buf(),
+        PathBuf::from(format!("{}-wal", db_path.display())),
+        PathBuf::from(format!("{}-shm", db_path.display())),
+    ] {
+        match fs::remove_file(&path) {
+            Ok(()) => {}
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+            Err(error) => {
+                return Err(error).with_context(|| format!("remove {}", path.display()));
+            }
+        }
+    }
+    Ok(())
+}
+
+fn detect_current_repo() -> Option<String> {
+    let mut path = std::env::current_dir().ok()?;
+    loop {
+        if path.join(".git").exists() {
+            return path
+                .file_name()
+                .and_then(|name| name.to_str())
+                .map(str::to_owned);
+        }
+        if !path.pop() {
+            return None;
+        }
+    }
+}
+
 fn compact_whitespace(value: &str) -> String {
     value.split_whitespace().collect::<Vec<_>>().join(" ")
 }
@@ -241,9 +428,9 @@ fn print_grouped_search_results(results: &[SearchResult], limit: usize) {
     for result in results {
         if !session_order
             .iter()
-            .any(|session_id| *session_id == result.session_id)
+            .any(|session_id| *session_id == result.session_key)
         {
-            session_order.push(&result.session_id);
+            session_order.push(&result.session_key);
         }
         if session_order.len() == limit {
             break;
@@ -253,10 +440,16 @@ fn print_grouped_search_results(results: &[SearchResult], limit: usize) {
     for (index, session_id) in session_order.iter().enumerate() {
         let session_results = results
             .iter()
-            .filter(|result| &result.session_id == session_id)
+            .filter(|result| &result.session_key == session_id)
             .collect::<Vec<_>>();
         let first = session_results[0];
-        println!("{}. {}  {}", index + 1, first.session_id, first.cwd);
+        println!(
+            "{}. {}  {}  {}",
+            index + 1,
+            first.session_key,
+            first.session_id,
+            first.cwd
+        );
         for result in session_results.into_iter().take(3) {
             println!(
                 "   - {}  {}:{}",
@@ -294,10 +487,12 @@ fn print_search_json(query: &str, results: &[SearchResult]) -> Result<()> {
                 result.source_line_number
             );
             json!({
+                "session_key": result.session_key,
                 "session_id": result.session_id,
                 "repo": result.repo,
                 "kind": result.kind.as_str(),
                 "cwd": result.cwd,
+                "session_timestamp": result.session_timestamp,
                 "source_file_path": result.source_file_path,
                 "source_line_number": result.source_line_number,
                 "source": source,
@@ -320,7 +515,7 @@ fn print_search_json(query: &str, results: &[SearchResult]) -> Result<()> {
 
 fn print_help() {
     println!(
-        "codex-recall\n\nCommands:\n  index [--db PATH] [--source PATH ...]\n  search QUERY [--db PATH] [--limit N] [--repo NAME] [--cwd PATH_PART] [--since DATE] [--json]\n  show SESSION_ID [--db PATH] [--limit N]\n  stats [--db PATH]"
+        "codex-recall\n\nCommands:\n  index [--db PATH] [--source PATH ...]\n  rebuild [--db PATH] [--source PATH ...]\n  search QUERY [--db PATH] [--limit N] [--repo NAME] [--all-repos] [--cwd PATH_PART] [--since DATE|Nd|today] [--json]\n  show SESSION_ID_OR_KEY [--db PATH] [--limit N]\n  doctor [--db PATH] [--json]\n  stats [--db PATH]"
     );
 }
 

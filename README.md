@@ -17,11 +17,14 @@ Raw JSONL files remain the source of truth.
 
 ```bash
 codex-recall index
+codex-recall rebuild
 codex-recall search "Stripe webhook"
 codex-recall search "Stripe webhook" --repo palabruno --since 2026-04-01
+codex-recall search "Stripe webhook" --since 7d
 codex-recall search "Stripe webhook" --cwd projects/palabruno
 codex-recall search "Stripe webhook" --json
-codex-recall show <session-id>
+codex-recall show <session-id-or-session-key>
+codex-recall doctor --json
 codex-recall stats
 ```
 
@@ -30,7 +33,8 @@ Useful flags:
 ```bash
 codex-recall index --db /tmp/index.sqlite --source ~/.codex/sessions/2026/04
 codex-recall search "source-map" --limit 5
-codex-recall show <session-id> --limit 20
+codex-recall search "source-map" --all-repos
+codex-recall show <session-key> --limit 20
 ```
 
 ## Behavior
@@ -39,14 +43,34 @@ codex-recall show <session-id> --limit 20
 - Skips Codex instruction preambles such as `AGENTS.md` and environment context blocks.
 - Deduplicates exact duplicate transcript events.
 - Keeps exact source provenance as `path:line`.
+- Stores a stable `session_key` derived from `session_id + source_file_path`, so duplicate active/archive transcripts do not collapse.
 - Uses SQLite FTS5 with safe query normalization, so punctuation-heavy queries like `source-map` work.
 - Falls back to matching any query term when no single event contains every term.
-- Supports search filters by derived repo slug, cwd substring, and session start date.
+- Supports search filters by repo slug, cwd substring, and session start date. Repo matching uses both the session cwd and command cwd values seen inside the session.
+- Accepts absolute `--since` dates plus relative values like `7d`, `30d`, `today`, and `yesterday`.
+- Boosts results from the current git repo by default. Use `--repo` to filter to a repo, or `--all-repos` to disable the current-repo boost.
 - Tracks file size and mtime so repeat indexing skips unchanged sessions.
 - Reports progress to stderr every 100 scanned files during indexing.
 - Groups text search output by session, with the best receipts under each session.
+- Ranks sessions by current-repo match, hit count, event kind, FTS rank, and recency.
 - Reports source-file counts and duplicate source-file counts in `stats`.
 - Keeps `--json` output compact by returning `text_preview` instead of full transcript blobs.
+- Separates progress and diagnostics onto stderr so `--json` output stays pipe-safe.
+
+## Maintenance
+
+Use `doctor` when the index feels stale or suspicious:
+
+```bash
+codex-recall doctor
+codex-recall doctor --json
+```
+
+Use `rebuild` when the disposable SQLite index should be recreated from the raw JSONL source files:
+
+```bash
+codex-recall rebuild
+```
 
 ## Local Verification
 

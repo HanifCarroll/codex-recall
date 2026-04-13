@@ -27,13 +27,31 @@ fn write_sample_session(root: &std::path::Path) {
 }
 
 fn write_session(root: &std::path::Path, id: &str, cwd: &str, timestamp: &str) {
+    write_session_file(
+        root,
+        &format!("{id}.jsonl"),
+        id,
+        cwd,
+        timestamp,
+        "The production webhook secret was missing.",
+    );
+}
+
+fn write_session_file(
+    root: &std::path::Path,
+    file_name: &str,
+    id: &str,
+    cwd: &str,
+    timestamp: &str,
+    message: &str,
+) {
     let session_dir = root.join("2026/04/13");
     fs::create_dir_all(&session_dir).unwrap();
     fs::write(
-        session_dir.join(format!("{id}.jsonl")),
+        session_dir.join(file_name),
         format!(
             r#"{{"timestamp":"{timestamp}","type":"session_meta","payload":{{"id":"{id}","timestamp":"{timestamp}","cwd":"{cwd}","cli_version":"0.1.0"}}}}
-{{"timestamp":"{timestamp}","type":"event_msg","payload":{{"type":"agent_message","message":"The production webhook secret was missing."}}}}
+{{"timestamp":"{timestamp}","type":"event_msg","payload":{{"type":"agent_message","message":"{message}"}}}}
 "#
         ),
     )
@@ -125,6 +143,10 @@ fn search_json_outputs_machine_readable_receipts() {
 
     let json: serde_json::Value = serde_json::from_slice(&search.stdout).unwrap();
     assert_eq!(json["query"], "webhook secret");
+    assert!(json["results"][0]["session_key"]
+        .as_str()
+        .unwrap()
+        .starts_with("session-1:"));
     assert_eq!(json["results"][0]["session_id"], "session-1");
     assert_eq!(json["results"][0]["source_line_number"], 3);
     assert_eq!(json["results"][0]["kind"], "assistant_message");
@@ -137,6 +159,71 @@ fn search_json_outputs_machine_readable_receipts() {
         .as_str()
         .unwrap()
         .contains("production webhook secret"));
+}
+
+#[test]
+fn show_disambiguates_duplicate_session_ids_and_accepts_session_key() {
+    let temp = temp_dir("show-duplicate");
+    let source = temp.join("sessions");
+    let db = temp.join("index.sqlite");
+    write_session_file(
+        &source,
+        "active.jsonl",
+        "session-dup",
+        "/Users/me/project",
+        "2026-04-13T01:00:00Z",
+        "The active webhook secret was missing.",
+    );
+    write_session_file(
+        &source,
+        "archived.jsonl",
+        "session-dup",
+        "/Users/me/project",
+        "2026-04-13T01:00:00Z",
+        "The archived webhook secret was missing.",
+    );
+
+    let index = Command::new(env!("CARGO_BIN_EXE_codex-recall"))
+        .args(["index", "--db"])
+        .arg(&db)
+        .args(["--source"])
+        .arg(&source)
+        .output()
+        .unwrap();
+    assert!(index.status.success());
+
+    let ambiguous_show = Command::new(env!("CARGO_BIN_EXE_codex-recall"))
+        .args(["show", "session-dup", "--db"])
+        .arg(&db)
+        .output()
+        .unwrap();
+    assert!(!ambiguous_show.status.success());
+    assert!(
+        String::from_utf8_lossy(&ambiguous_show.stderr).contains("multiple indexed sessions match")
+    );
+
+    let search = Command::new(env!("CARGO_BIN_EXE_codex-recall"))
+        .args(["search", "archived webhook", "--json", "--db"])
+        .arg(&db)
+        .output()
+        .unwrap();
+    assert!(search.status.success());
+    let json: serde_json::Value = serde_json::from_slice(&search.stdout).unwrap();
+    let key = json["results"][0]["session_key"].as_str().unwrap();
+
+    let show = Command::new(env!("CARGO_BIN_EXE_codex-recall"))
+        .args(["show", key, "--db"])
+        .arg(&db)
+        .output()
+        .unwrap();
+    assert!(
+        show.status.success(),
+        "show failed: {}",
+        String::from_utf8_lossy(&show.stderr)
+    );
+    let stdout = String::from_utf8_lossy(&show.stdout);
+    assert!(stdout.contains(key));
+    assert!(stdout.contains("archived webhook secret"));
 }
 
 #[test]
@@ -233,6 +320,164 @@ fn search_filters_by_repo_cwd_and_since_flags() {
     assert!(stdout.contains("new-palabruno"));
     assert!(!stdout.contains("old-palabruno"));
     assert!(!stdout.contains("genrupt"));
+}
+
+#[test]
+fn search_accepts_relative_since_days() {
+    let temp = temp_dir("relative-since");
+    let source = temp.join("sessions");
+    let db = temp.join("index.sqlite");
+    write_session(
+        &source,
+        "ancient",
+        "/Users/me/projects/palabruno",
+        "1970-01-01T01:00:00Z",
+    );
+    write_session(
+        &source,
+        "future",
+        "/Users/me/projects/palabruno",
+        "2999-01-01T01:00:00Z",
+    );
+
+    let index = Command::new(env!("CARGO_BIN_EXE_codex-recall"))
+        .args(["index", "--db"])
+        .arg(&db)
+        .args(["--source"])
+        .arg(&source)
+        .output()
+        .unwrap();
+    assert!(index.status.success());
+
+    let search = Command::new(env!("CARGO_BIN_EXE_codex-recall"))
+        .args(["search", "webhook secret", "--since", "7d", "--db"])
+        .arg(&db)
+        .output()
+        .unwrap();
+    assert!(
+        search.status.success(),
+        "search failed: {}",
+        String::from_utf8_lossy(&search.stderr)
+    );
+
+    let stdout = String::from_utf8_lossy(&search.stdout);
+    assert!(stdout.contains("future"));
+    assert!(!stdout.contains("ancient"));
+}
+
+#[test]
+fn search_prioritizes_current_repo_by_default() {
+    let temp = temp_dir("current-repo");
+    let source = temp.join("sessions");
+    let db = temp.join("index.sqlite");
+    let current_repo = temp.join("project");
+    fs::create_dir_all(current_repo.join(".git")).unwrap();
+
+    write_session(
+        &source,
+        "other",
+        "/Users/me/projects/other",
+        "2026-04-13T01:00:00Z",
+    );
+    write_session_file(
+        &source,
+        "project.jsonl",
+        "project",
+        current_repo.to_str().unwrap(),
+        "2026-04-01T01:00:00Z",
+        "The production webhook secret was missing.",
+    );
+
+    let index = Command::new(env!("CARGO_BIN_EXE_codex-recall"))
+        .args(["index", "--db"])
+        .arg(&db)
+        .args(["--source"])
+        .arg(&source)
+        .output()
+        .unwrap();
+    assert!(index.status.success());
+
+    let search = Command::new(env!("CARGO_BIN_EXE_codex-recall"))
+        .current_dir(&current_repo)
+        .args(["search", "webhook secret", "--db"])
+        .arg(&db)
+        .output()
+        .unwrap();
+    assert!(
+        search.status.success(),
+        "search failed: {}",
+        String::from_utf8_lossy(&search.stderr)
+    );
+
+    let first_line = String::from_utf8_lossy(&search.stdout)
+        .lines()
+        .next()
+        .unwrap()
+        .to_owned();
+    assert!(first_line.contains("project"), "{first_line}");
+}
+
+#[test]
+fn doctor_json_reports_database_checks() {
+    let temp = temp_dir("doctor-json");
+    let db = temp.join("index.sqlite");
+
+    let doctor = Command::new(env!("CARGO_BIN_EXE_codex-recall"))
+        .args(["doctor", "--json", "--db"])
+        .arg(&db)
+        .output()
+        .unwrap();
+    assert!(
+        doctor.status.success(),
+        "doctor failed: {}",
+        String::from_utf8_lossy(&doctor.stderr)
+    );
+
+    let json: serde_json::Value = serde_json::from_slice(&doctor.stdout).unwrap();
+    assert_eq!(json["ok"], true);
+    assert_eq!(json["checks"]["quick_check"], "ok");
+    assert_eq!(json["checks"]["fts_integrity"], "ok");
+}
+
+#[test]
+fn rebuild_recreates_index_from_current_sources() {
+    let temp = temp_dir("rebuild");
+    let source = temp.join("sessions");
+    let db = temp.join("index.sqlite");
+    write_sample_session(&source);
+
+    let index = Command::new(env!("CARGO_BIN_EXE_codex-recall"))
+        .args(["index", "--db"])
+        .arg(&db)
+        .args(["--source"])
+        .arg(&source)
+        .output()
+        .unwrap();
+    assert!(index.status.success());
+
+    fs::remove_dir_all(&source).unwrap();
+    fs::create_dir_all(&source).unwrap();
+
+    let rebuild = Command::new(env!("CARGO_BIN_EXE_codex-recall"))
+        .args(["rebuild", "--db"])
+        .arg(&db)
+        .args(["--source"])
+        .arg(&source)
+        .output()
+        .unwrap();
+    assert!(
+        rebuild.status.success(),
+        "rebuild failed: {}",
+        String::from_utf8_lossy(&rebuild.stderr)
+    );
+
+    let stats = Command::new(env!("CARGO_BIN_EXE_codex-recall"))
+        .args(["stats", "--db"])
+        .arg(&db)
+        .output()
+        .unwrap();
+    assert!(stats.status.success());
+    assert!(String::from_utf8_lossy(&stats.stdout).starts_with("0 sessions, 0 events"));
 }
 
 #[test]
