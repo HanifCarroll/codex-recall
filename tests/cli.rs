@@ -101,4 +101,9 @@ fn search_json_outputs_machine_readable_receipts() {
         .as_str()
         .unwrap()
         .contains(":3"));
+    assert!(json["results"][0].get("text").is_none());
+    assert!(json["results"][0]["text_preview"]
+        .as_str()
+        .unwrap()
+        .contains("production webhook secret"));
 }

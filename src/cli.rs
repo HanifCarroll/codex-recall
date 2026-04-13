@@ -159,6 +159,21 @@ fn compact_whitespace(value: &str) -> String {
     value.split_whitespace().collect::<Vec<_>>().join(" ")
 }
 
+fn preview(value: &str, limit: usize) -> String {
+    let compact = compact_whitespace(value);
+    if compact.len() <= limit {
+        return compact;
+    }
+
+    let mut output = compact
+        .char_indices()
+        .take_while(|(index, _)| *index < limit)
+        .map(|(_, ch)| ch)
+        .collect::<String>();
+    output.push_str(" ...");
+    output
+}
+
 fn print_search_json(query: &str, results: &[SearchResult]) -> Result<()> {
     let results = results
         .iter()
@@ -178,7 +193,7 @@ fn print_search_json(query: &str, results: &[SearchResult]) -> Result<()> {
                 "source_timestamp": result.source_timestamp,
                 "score": result.score,
                 "snippet": compact_whitespace(&result.snippet),
-                "text": result.text,
+                "text_preview": preview(&result.text, 500),
             })
         })
         .collect::<Vec<_>>();

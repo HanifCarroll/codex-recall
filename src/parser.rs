@@ -1,5 +1,6 @@
 use anyhow::{Context, Result};
 use serde_json::Value;
+use std::collections::HashSet;
 use std::fs::File;
 use std::io::{BufRead, BufReader};
 use std::path::{Path, PathBuf};
@@ -106,13 +107,20 @@ pub fn parse_session_file(path: &Path) -> Result<Option<ParsedSession>> {
         return Ok(None);
     };
 
-    let events = pending_events
-        .into_iter()
-        .map(|mut event| {
+    let mut seen = HashSet::new();
+    let mut events = Vec::new();
+    for mut event in pending_events {
+        let dedupe_key = format!(
+            "{}\u{1f}{}\u{1f}{}",
+            event.kind.as_str(),
+            event.role.as_deref().unwrap_or_default(),
+            event.text
+        );
+        if seen.insert(dedupe_key) {
             event.session_id = session.id.clone();
-            event
-        })
-        .collect();
+            events.push(event);
+        }
+    }
 
     Ok(Some(ParsedSession { session, events }))
 }
@@ -362,5 +370,21 @@ mod tests {
         let parsed = parse_session_file(&path).unwrap().unwrap();
 
         assert_eq!(parsed.events.len(), 0);
+    }
+
+    #[test]
+    fn removes_exact_duplicate_transcript_events() {
+        let path = temp_jsonl(
+            "duplicates",
+            r#"{"timestamp":"2026-04-13T01:00:00Z","type":"session_meta","payload":{"id":"session-3","timestamp":"2026-04-13T01:00:00Z","cwd":"/tmp"}}
+{"timestamp":"2026-04-13T01:00:01Z","type":"event_msg","payload":{"type":"agent_message","message":"Same assistant answer."}}
+{"timestamp":"2026-04-13T01:00:01Z","type":"response_item","payload":{"type":"message","role":"assistant","content":[{"type":"output_text","text":"Same assistant answer."}]}}
+"#,
+        );
+
+        let parsed = parse_session_file(&path).unwrap().unwrap();
+
+        assert_eq!(parsed.events.len(), 1);
+        assert_eq!(parsed.events[0].source_line_number, 2);
     }
 }

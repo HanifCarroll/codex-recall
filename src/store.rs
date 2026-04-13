@@ -74,6 +74,11 @@ impl Store {
     }
 
     pub fn search(&self, query: &str, limit: usize) -> Result<Vec<SearchResult>> {
+        let query = normalize_fts_query(query);
+        if query.is_empty() {
+            return Ok(Vec::new());
+        }
+
         let limit = limit.max(1).min(100);
         let mut statement = self.conn.prepare(
             r#"
@@ -231,6 +236,29 @@ impl Store {
     }
 }
 
+fn normalize_fts_query(query: &str) -> String {
+    let mut terms = Vec::new();
+    let mut current = String::new();
+
+    for ch in query.chars() {
+        if ch.is_alphanumeric() || ch == '_' {
+            current.push(ch);
+        } else if !current.is_empty() {
+            terms.push(std::mem::take(&mut current));
+        }
+    }
+
+    if !current.is_empty() {
+        terms.push(current);
+    }
+
+    terms
+        .into_iter()
+        .map(|term| format!("\"{}\"", term.replace('"', "\"\"")))
+        .collect::<Vec<_>>()
+        .join(" AND ")
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -313,5 +341,16 @@ mod tests {
         assert_eq!(results[0].cwd, "/Users/me/project");
         assert!(results[0].snippet.contains("webhook"));
         assert!(results[0].score < 0.0);
+    }
+
+    #[test]
+    fn search_accepts_punctuation_without_exposing_fts_syntax() {
+        let store = Store::open(temp_db_path("punctuation")).unwrap();
+        store.index_session(&sample_session()).unwrap();
+
+        let results = store.search("webhook-secret", 5).unwrap();
+
+        assert_eq!(results.len(), 1);
+        assert_eq!(results[0].source_line_number, 3);
     }
 }
