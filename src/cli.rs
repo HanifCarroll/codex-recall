@@ -292,16 +292,6 @@ fn run_doctor(args: Vec<String>) -> Result<()> {
     }
 
     let db_existed = db_path.exists();
-    let store = Store::open(&db_path)?;
-    let stats = store.stats()?;
-    let quick_check = match store.quick_check() {
-        Ok(value) => value,
-        Err(error) => format!("error: {error:#}"),
-    };
-    let fts_integrity = match store.fts_integrity_check() {
-        Ok(()) => "ok".to_owned(),
-        Err(error) => format!("error: {error:#}"),
-    };
     let sources = default_source_roots()?;
     let source_status = sources
         .iter()
@@ -312,6 +302,52 @@ fn run_doctor(args: Vec<String>) -> Result<()> {
             })
         })
         .collect::<Vec<_>>();
+
+    if !db_existed {
+        if json_output {
+            let value = json!({
+                "ok": false,
+                "db_path": db_path,
+                "db_existed": false,
+                "db_exists": false,
+                "checks": {
+                    "quick_check": "missing",
+                    "fts_integrity": "missing",
+                },
+                "stats": {
+                    "sessions": 0,
+                    "events": 0,
+                    "source_files": 0,
+                    "duplicate_source_files": 0,
+                },
+                "sources": source_status,
+            });
+            println!("{}", serde_json::to_string_pretty(&value)?);
+            return Ok(());
+        }
+
+        println!("database: {} (missing)", db_path.display());
+        println!("quick_check: missing");
+        println!("fts_integrity: missing");
+        println!("stats: 0 sessions, 0 events, 0 source files, 0 duplicate source files");
+        for source in sources {
+            let status = if source.exists() { "exists" } else { "missing" };
+            println!("source: {} ({status})", source.display());
+        }
+        println!("next: run codex-recall index");
+        return Ok(());
+    }
+
+    let store = Store::open_readonly(&db_path)?;
+    let stats = store.stats()?;
+    let quick_check = match store.quick_check() {
+        Ok(value) => value,
+        Err(error) => format!("error: {error:#}"),
+    };
+    let fts_integrity = match store.fts_read_check() {
+        Ok(()) => "ok".to_owned(),
+        Err(error) => format!("error: {error:#}"),
+    };
     let ok = quick_check == "ok" && fts_integrity == "ok";
 
     if json_output {
@@ -319,6 +355,7 @@ fn run_doctor(args: Vec<String>) -> Result<()> {
             "ok": ok,
             "db_path": db_path,
             "db_existed": db_existed,
+            "db_exists": db_existed,
             "checks": {
                 "quick_check": quick_check,
                 "fts_integrity": fts_integrity,

@@ -420,7 +420,18 @@ fn search_prioritizes_current_repo_by_default() {
 #[test]
 fn doctor_json_reports_database_checks() {
     let temp = temp_dir("doctor-json");
+    let source = temp.join("sessions");
     let db = temp.join("index.sqlite");
+    write_sample_session(&source);
+
+    let index = Command::new(env!("CARGO_BIN_EXE_codex-recall"))
+        .args(["index", "--db"])
+        .arg(&db)
+        .args(["--source"])
+        .arg(&source)
+        .output()
+        .unwrap();
+    assert!(index.status.success());
 
     let doctor = Command::new(env!("CARGO_BIN_EXE_codex-recall"))
         .args(["doctor", "--json", "--db"])
@@ -435,8 +446,36 @@ fn doctor_json_reports_database_checks() {
 
     let json: serde_json::Value = serde_json::from_slice(&doctor.stdout).unwrap();
     assert_eq!(json["ok"], true);
+    assert_eq!(json["db_exists"], true);
     assert_eq!(json["checks"]["quick_check"], "ok");
     assert_eq!(json["checks"]["fts_integrity"], "ok");
+}
+
+#[test]
+fn doctor_does_not_create_missing_database() {
+    let temp = temp_dir("doctor-missing");
+    let db = temp.join("missing").join("index.sqlite");
+
+    let doctor = Command::new(env!("CARGO_BIN_EXE_codex-recall"))
+        .args(["doctor", "--json", "--db"])
+        .arg(&db)
+        .output()
+        .unwrap();
+    assert!(
+        doctor.status.success(),
+        "doctor failed: {}",
+        String::from_utf8_lossy(&doctor.stderr)
+    );
+
+    let json: serde_json::Value = serde_json::from_slice(&doctor.stdout).unwrap();
+    assert_eq!(json["ok"], false);
+    assert_eq!(json["db_exists"], false);
+    assert_eq!(json["checks"]["quick_check"], "missing");
+    assert!(!db.exists(), "doctor should not create the database");
+    assert!(
+        !db.parent().unwrap().exists(),
+        "doctor should not create the database directory"
+    );
 }
 
 #[test]

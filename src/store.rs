@@ -1,9 +1,11 @@
 use crate::parser::{EventKind, ParsedSession};
 use anyhow::{Context, Result};
-use rusqlite::{params, params_from_iter, Connection};
+use rusqlite::{params, params_from_iter, Connection, OpenFlags};
 use std::collections::{BTreeSet, HashMap};
 use std::path::{Path, PathBuf};
 use std::time::Duration;
+
+const CONTENT_VERSION: i64 = 2;
 
 pub struct Store {
     conn: Connection,
@@ -115,6 +117,14 @@ impl Store {
         Ok(store)
     }
 
+    pub fn open_readonly(path: impl AsRef<Path>) -> Result<Self> {
+        let path = path.as_ref();
+        let conn = Connection::open_with_flags(path, OpenFlags::SQLITE_OPEN_READ_ONLY)
+            .with_context(|| format!("open db read-only {}", path.display()))?;
+        conn.busy_timeout(Duration::from_secs(5))?;
+        Ok(Self { conn })
+    }
+
     pub fn index_session(&self, parsed: &ParsedSession) -> Result<()> {
         self.conn.execute("BEGIN IMMEDIATE", [])?;
         let result = self.index_session_inner(parsed);
@@ -172,6 +182,15 @@ impl Store {
             [],
         )?;
         Ok(())
+    }
+
+    pub fn fts_read_check(&self) -> Result<()> {
+        self.conn
+            .query_row("SELECT COUNT(*) FROM events_fts", [], |row| {
+                row.get::<_, i64>(0)
+            })
+            .map(|_| ())
+            .map_err(Into::into)
     }
 
     pub fn search(&self, query: &str, limit: usize) -> Result<Vec<SearchResult>> {
@@ -401,11 +420,13 @@ impl Store {
             WHERE source_file_path = ?
               AND source_file_mtime_ns = ?
               AND source_file_size = ?
+              AND content_version = ?
             "#,
             params![
                 source_file_path.display().to_string(),
                 source_file_mtime_ns,
-                source_file_size
+                source_file_size,
+                CONTENT_VERSION,
             ],
             |row| row.get::<_, i64>(0),
         )?;
@@ -423,13 +444,14 @@ impl Store {
         self.conn.execute(
             r#"
             INSERT INTO ingestion_state (
-                source_file_path, source_file_mtime_ns, source_file_size, session_id, session_key, indexed_at
-            ) VALUES (?, ?, ?, ?, ?, strftime('%Y-%m-%dT%H:%M:%fZ','now'))
+                source_file_path, source_file_mtime_ns, source_file_size, session_id, session_key, content_version, indexed_at
+            ) VALUES (?, ?, ?, ?, ?, ?, strftime('%Y-%m-%dT%H:%M:%fZ','now'))
             ON CONFLICT(source_file_path) DO UPDATE SET
                 source_file_mtime_ns = excluded.source_file_mtime_ns,
                 source_file_size = excluded.source_file_size,
                 session_id = excluded.session_id,
                 session_key = excluded.session_key,
+                content_version = excluded.content_version,
                 indexed_at = excluded.indexed_at
             "#,
             params![
@@ -438,6 +460,7 @@ impl Store {
                 source_file_size,
                 session_id,
                 session_key,
+                CONTENT_VERSION,
             ],
         )?;
         Ok(())
@@ -457,6 +480,7 @@ impl Store {
 
         self.create_schema_objects()?;
         self.ensure_ingestion_state_session_key_column()?;
+        self.ensure_ingestion_state_content_version_column()?;
         self.backfill_session_repos()?;
         self.backfill_session_repo_memberships()?;
         self.backfill_ingestion_session_keys()?;
@@ -523,6 +547,7 @@ impl Store {
                 source_file_size INTEGER NOT NULL,
                 session_id TEXT,
                 session_key TEXT,
+                content_version INTEGER NOT NULL DEFAULT 2,
                 indexed_at TEXT NOT NULL
             );
             "#,
@@ -659,6 +684,21 @@ impl Store {
 
         match self.conn.execute(
             "ALTER TABLE ingestion_state ADD COLUMN session_key TEXT",
+            [],
+        ) {
+            Ok(_) => Ok(()),
+            Err(error) if error.to_string().contains("duplicate column name") => Ok(()),
+            Err(error) => Err(error.into()),
+        }
+    }
+
+    fn ensure_ingestion_state_content_version_column(&self) -> Result<()> {
+        if self.table_has_column("ingestion_state", "content_version")? {
+            return Ok(());
+        }
+
+        match self.conn.execute(
+            "ALTER TABLE ingestion_state ADD COLUMN content_version INTEGER NOT NULL DEFAULT 0",
             [],
         ) {
             Ok(_) => Ok(()),
@@ -952,10 +992,10 @@ fn append_since_clause(
             query_params.push(format!("-{days} days"));
         }
         SinceFilter::Today => {
-            sql.push_str("datetime('now', 'start of day')");
+            sql.push_str("datetime('now', 'localtime', 'start of day', 'utc')");
         }
         SinceFilter::Yesterday => {
-            sql.push_str("datetime('now', 'start of day', '-1 day')");
+            sql.push_str("datetime('now', 'localtime', 'start of day', '-1 day', 'utc')");
         }
     }
     Ok(())
@@ -1132,287 +1172,4 @@ fn repo_slug(cwd: &str) -> String {
 }
 
 #[cfg(test)]
-mod tests {
-    use super::*;
-    use crate::parser::{EventKind, ParsedEvent, ParsedSession, SessionMetadata};
-    use std::path::PathBuf;
-
-    fn temp_db_path(name: &str) -> PathBuf {
-        let dir = std::env::temp_dir().join(format!(
-            "codex-recall-store-test-{}-{}",
-            std::process::id(),
-            name
-        ));
-        std::fs::create_dir_all(&dir).unwrap();
-        dir.join("index.sqlite")
-    }
-
-    fn sample_session() -> ParsedSession {
-        sample_session_with(
-            "session-1",
-            "/Users/me/project",
-            "2026-04-13T01:00:00Z",
-            "/tmp/session.jsonl",
-        )
-    }
-
-    fn sample_session_with(
-        id: &str,
-        cwd: &str,
-        timestamp: &str,
-        source_path: &str,
-    ) -> ParsedSession {
-        let source = PathBuf::from(source_path);
-        ParsedSession {
-            session: SessionMetadata {
-                id: id.to_owned(),
-                timestamp: timestamp.to_owned(),
-                cwd: cwd.to_owned(),
-                cli_version: Some("0.1.0".to_owned()),
-                source_file_path: source.clone(),
-            },
-            events: vec![
-                ParsedEvent {
-                    session_id: "session-1".to_owned(),
-                    kind: EventKind::UserMessage,
-                    role: Some("user".to_owned()),
-                    text: "Find the RevenueCat Stripe webhook bug".to_owned(),
-                    command: None,
-                    cwd: None,
-                    exit_code: None,
-                    source_timestamp: Some("2026-04-13T01:00:01Z".to_owned()),
-                    source_file_path: source.clone(),
-                    source_line_number: 2,
-                },
-                ParsedEvent {
-                    session_id: "session-1".to_owned(),
-                    kind: EventKind::AssistantMessage,
-                    role: Some("assistant".to_owned()),
-                    text: "The webhook secret was missing in production.".to_owned(),
-                    command: None,
-                    cwd: None,
-                    exit_code: None,
-                    source_timestamp: Some("2026-04-13T01:00:02Z".to_owned()),
-                    source_file_path: source,
-                    source_line_number: 3,
-                },
-            ],
-        }
-    }
-
-    #[test]
-    fn indexes_sessions_idempotently_and_counts_rows() {
-        let store = Store::open(temp_db_path("idempotent")).unwrap();
-        let session = sample_session();
-
-        store.index_session(&session).unwrap();
-        store.index_session(&session).unwrap();
-
-        let stats = store.stats().unwrap();
-        assert_eq!(stats.session_count, 1);
-        assert_eq!(stats.event_count, 2);
-    }
-
-    #[test]
-    fn searches_fts_with_source_provenance() {
-        let store = Store::open(temp_db_path("search")).unwrap();
-        store.index_session(&sample_session()).unwrap();
-
-        let results = store.search("webhook secret", 5).unwrap();
-
-        assert_eq!(results.len(), 1);
-        assert!(results[0].session_key.starts_with("session-1:"));
-        assert_eq!(results[0].session_id, "session-1");
-        assert_eq!(results[0].kind, EventKind::AssistantMessage);
-        assert_eq!(results[0].source_line_number, 3);
-        assert_eq!(results[0].cwd, "/Users/me/project");
-        assert!(results[0].snippet.contains("webhook"));
-        assert!(results[0].score < 0.0);
-    }
-
-    #[test]
-    fn keeps_duplicate_session_ids_by_source_file() {
-        let store = Store::open(temp_db_path("duplicate-session-ids")).unwrap();
-        store
-            .index_session(&sample_session_with(
-                "session-1",
-                "/Users/me/project",
-                "2026-04-13T01:00:00Z",
-                "/tmp/active-session.jsonl",
-            ))
-            .unwrap();
-        store
-            .index_session(&sample_session_with(
-                "session-1",
-                "/Users/me/project",
-                "2026-04-13T01:00:00Z",
-                "/tmp/archived-session.jsonl",
-            ))
-            .unwrap();
-
-        let stats = store.stats().unwrap();
-        assert_eq!(stats.session_count, 2);
-        assert_eq!(stats.event_count, 4);
-
-        let results = store.search("webhook secret", 10).unwrap();
-        let mut keys = results
-            .iter()
-            .map(|result| result.session_key.as_str())
-            .collect::<Vec<_>>();
-        keys.sort_unstable();
-        keys.dedup();
-
-        assert_eq!(keys.len(), 2);
-        assert!(results
-            .iter()
-            .all(|result| result.session_id == "session-1"));
-    }
-
-    #[test]
-    fn ranks_current_repo_sessions_before_other_repos() {
-        let store = Store::open(temp_db_path("current-repo-rank")).unwrap();
-        store
-            .index_session(&sample_session_with(
-                "other",
-                "/Users/me/projects/other",
-                "2026-04-13T01:00:00Z",
-                "/tmp/other.jsonl",
-            ))
-            .unwrap();
-        store
-            .index_session(&sample_session_with(
-                "project",
-                "/Users/me/projects/project",
-                "2026-04-01T01:00:00Z",
-                "/tmp/project.jsonl",
-            ))
-            .unwrap();
-
-        let results = store
-            .search_with_options(SearchOptions {
-                query: "webhook secret".to_owned(),
-                limit: 10,
-                repo: None,
-                cwd: None,
-                since: None,
-                current_repo: Some("project".to_owned()),
-            })
-            .unwrap();
-
-        assert_eq!(results[0].session_id, "project");
-        assert_eq!(results[0].repo, "project");
-    }
-
-    #[test]
-    fn ranks_current_repo_when_only_a_command_ran_inside_that_repo() {
-        let store = Store::open(temp_db_path("current-repo-command-cwd")).unwrap();
-        store
-            .index_session(&sample_session_with(
-                "other",
-                "/Users/me/projects/other",
-                "2026-04-13T01:00:00Z",
-                "/tmp/other-command.jsonl",
-            ))
-            .unwrap();
-
-        let mut project_session = sample_session_with(
-            "project",
-            "/Users/me/hanif-md",
-            "2026-04-01T01:00:00Z",
-            "/tmp/project-command.jsonl",
-        );
-        project_session.events.push(ParsedEvent {
-            session_id: "project".to_owned(),
-            kind: EventKind::Command,
-            role: None,
-            text: "$ rg webhook".to_owned(),
-            command: Some("rg webhook".to_owned()),
-            cwd: Some("/Users/me/projects/project".to_owned()),
-            exit_code: Some(0),
-            source_timestamp: Some("2026-04-01T01:00:03Z".to_owned()),
-            source_file_path: PathBuf::from("/tmp/project-command.jsonl"),
-            source_line_number: 4,
-        });
-        store.index_session(&project_session).unwrap();
-
-        let results = store
-            .search_with_options(SearchOptions {
-                query: "webhook secret".to_owned(),
-                limit: 10,
-                repo: None,
-                cwd: None,
-                since: None,
-                current_repo: Some("project".to_owned()),
-            })
-            .unwrap();
-
-        assert_eq!(results[0].session_id, "project");
-        assert_eq!(results[0].repo, "hanif-md");
-    }
-
-    #[test]
-    fn filters_search_by_repo_cwd_and_since() {
-        let store = Store::open(temp_db_path("filters")).unwrap();
-        store
-            .index_session(&sample_session_with(
-                "old-palabruno",
-                "/Users/me/projects/palabruno",
-                "2026-04-01T01:00:00Z",
-                "/tmp/old.jsonl",
-            ))
-            .unwrap();
-        store
-            .index_session(&sample_session_with(
-                "new-palabruno",
-                "/Users/me/projects/palabruno",
-                "2026-04-13T01:00:00Z",
-                "/tmp/new.jsonl",
-            ))
-            .unwrap();
-        store
-            .index_session(&sample_session_with(
-                "genrupt",
-                "/Users/me/projects/Genrupt",
-                "2026-04-13T01:00:00Z",
-                "/tmp/genrupt.jsonl",
-            ))
-            .unwrap();
-
-        let results = store
-            .search_with_options(SearchOptions {
-                query: "webhook secret".to_owned(),
-                limit: 10,
-                repo: Some("palabruno".to_owned()),
-                cwd: Some("projects/palabruno".to_owned()),
-                since: Some("2026-04-10".to_owned()),
-                current_repo: None,
-            })
-            .unwrap();
-
-        assert_eq!(results.len(), 1);
-        assert_eq!(results[0].session_id, "new-palabruno");
-        assert_eq!(results[0].repo, "palabruno");
-    }
-
-    #[test]
-    fn falls_back_to_any_query_term_when_all_terms_match_no_single_event() {
-        let store = Store::open(temp_db_path("fallback")).unwrap();
-        store.index_session(&sample_session()).unwrap();
-
-        let results = store.search("RevenueCat missing", 5).unwrap();
-
-        assert!(!results.is_empty());
-        assert_eq!(results[0].session_id, "session-1");
-    }
-
-    #[test]
-    fn search_accepts_punctuation_without_exposing_fts_syntax() {
-        let store = Store::open(temp_db_path("punctuation")).unwrap();
-        store.index_session(&sample_session()).unwrap();
-
-        let results = store.search("webhook-secret", 5).unwrap();
-
-        assert_eq!(results.len(), 1);
-        assert_eq!(results[0].source_line_number, 3);
-    }
-}
+mod tests;

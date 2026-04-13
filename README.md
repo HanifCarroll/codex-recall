@@ -40,6 +40,7 @@ codex-recall show <session-key> --limit 20
 ## Behavior
 
 - Streams JSONL files and indexes high-signal user, assistant, and command events.
+- Redacts common secret shapes before writing searchable text to SQLite.
 - Skips Codex instruction preambles such as `AGENTS.md` and environment context blocks.
 - Deduplicates exact duplicate transcript events.
 - Keeps exact source provenance as `path:line`.
@@ -48,6 +49,7 @@ codex-recall show <session-key> --limit 20
 - Falls back to matching any query term when no single event contains every term.
 - Supports search filters by repo slug, cwd substring, and session start date. Repo matching uses both the session cwd and command cwd values seen inside the session.
 - Accepts absolute `--since` dates plus relative values like `7d`, `30d`, `today`, and `yesterday`.
+- Interprets `today` and `yesterday` using the local day boundary, then compares against UTC transcript timestamps.
 - Boosts results from the current git repo by default. Use `--repo` to filter to a repo, or `--all-repos` to disable the current-repo boost.
 - Tracks file size and mtime so repeat indexing skips unchanged sessions.
 - Reports progress to stderr every 100 scanned files during indexing.
@@ -65,6 +67,8 @@ Use `doctor` when the index feels stale or suspicious:
 codex-recall doctor
 codex-recall doctor --json
 ```
+
+`doctor` is read-only when the database is missing; it reports the missing index instead of creating an empty one.
 
 Use `rebuild` when the disposable SQLite index should be recreated from the raw JSONL source files:
 

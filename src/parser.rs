@@ -1,3 +1,4 @@
+use crate::redact::redact_secrets;
 use anyhow::{Context, Result};
 use serde_json::Value;
 use std::collections::HashSet;
@@ -6,6 +7,9 @@ use std::io::{BufRead, BufReader};
 use std::path::{Path, PathBuf};
 
 const COMMAND_OUTPUT_LIMIT: usize = 4_000;
+const COMMAND_OUTPUT_REDACTION_WINDOW: usize = COMMAND_OUTPUT_LIMIT + 512;
+const MESSAGE_TEXT_LIMIT: usize = 20_000;
+const MESSAGE_TEXT_REDACTION_WINDOW: usize = MESSAGE_TEXT_LIMIT + 512;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ParsedSession {
@@ -225,11 +229,14 @@ fn non_empty_text_event(
         return None;
     }
 
+    let capped_text = cap_text(text, MESSAGE_TEXT_REDACTION_WINDOW);
+    let redacted_text = cap_text(&redact_secrets(&capped_text), MESSAGE_TEXT_LIMIT);
+
     Some(ParsedEvent {
         session_id: String::new(),
         kind,
         role: role.map(str::to_owned),
-        text: text.to_owned(),
+        text: redacted_text,
         command: None,
         cwd: None,
         exit_code: None,
@@ -255,10 +262,11 @@ fn parse_command_event(
     if command.is_empty() {
         return None;
     }
+    let redacted_command = redact_secrets(command);
 
     let stdout = payload.get("stdout").and_then(Value::as_str).unwrap_or("");
     let stderr = payload.get("stderr").and_then(Value::as_str).unwrap_or("");
-    let mut text = format!("$ {command}");
+    let mut text = format!("$ {redacted_command}");
     let output = payload
         .get("aggregated_output")
         .and_then(Value::as_str)
@@ -267,7 +275,11 @@ fn parse_command_event(
         .unwrap_or_else(|| join_command_output(stdout, stderr));
     if !output.is_empty() {
         text.push('\n');
-        text.push_str(&cap_text(&output, COMMAND_OUTPUT_LIMIT));
+        let capped_output = cap_text(&output, COMMAND_OUTPUT_REDACTION_WINDOW);
+        text.push_str(&cap_text(
+            &redact_secrets(&capped_output),
+            COMMAND_OUTPUT_LIMIT,
+        ));
     }
 
     Some(ParsedEvent {
@@ -275,7 +287,7 @@ fn parse_command_event(
         kind: EventKind::Command,
         role: None,
         text,
-        command: Some(command.to_owned()),
+        command: Some(redacted_command),
         cwd: payload
             .get("cwd")
             .and_then(Value::as_str)
@@ -455,5 +467,55 @@ mod tests {
             Some("/Users/me/projects/codex-recall")
         );
         assert!(parsed.events[0].text.contains("test result: ok"));
+    }
+
+    #[test]
+    fn redacts_secrets_before_events_are_indexed() {
+        let path = temp_jsonl(
+            "redaction",
+            r#"{"timestamp":"2026-04-13T01:00:00Z","type":"session_meta","payload":{"id":"session-6","timestamp":"2026-04-13T01:00:00Z","cwd":"/Users/me/project"}}
+{"timestamp":"2026-04-13T01:00:01Z","type":"event_msg","payload":{"type":"user_message","message":"Use API_KEY=abc123456789 and Authorization: Bearer eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ"}}
+{"timestamp":"2026-04-13T01:00:02Z","type":"event_msg","payload":{"type":"exec_command_end","command":"curl -H 'Authorization: Bearer supersecrettoken123456' https://example.com","cwd":"/Users/me/project","exit_code":0,"stdout":"github_pat_1234567890abcdefghijklmnop\n","stderr":""}}
+"#,
+        );
+
+        let parsed = parse_session_file(&path).unwrap().unwrap();
+
+        assert_eq!(parsed.events.len(), 2);
+        assert!(parsed.events[0].text.contains("API_KEY=[REDACTED]"));
+        assert!(parsed.events[0]
+            .text
+            .contains("Authorization: Bearer [REDACTED]"));
+        assert!(parsed.events[1]
+            .command
+            .as_deref()
+            .unwrap()
+            .contains("Authorization: Bearer [REDACTED]"));
+        assert!(parsed.events[1].text.contains("[REDACTED]"));
+        assert!(!parsed.events.iter().any(|event| {
+            event.text.contains("abc123456789")
+                || event.text.contains("supersecrettoken123456")
+                || event.text.contains("github_pat_1234567890")
+        }));
+    }
+
+    #[test]
+    fn caps_large_message_events_before_indexing() {
+        let long_text = "alpha ".repeat(10_000);
+        let escaped = serde_json::to_string(&long_text).unwrap();
+        let path = temp_jsonl(
+            "large-message",
+            &format!(
+                r#"{{"timestamp":"2026-04-13T01:00:00Z","type":"session_meta","payload":{{"id":"session-7","timestamp":"2026-04-13T01:00:00Z","cwd":"/Users/me/project"}}}}
+{{"timestamp":"2026-04-13T01:00:01Z","type":"event_msg","payload":{{"type":"user_message","message":{escaped}}}}}
+"#
+            ),
+        );
+
+        let parsed = parse_session_file(&path).unwrap().unwrap();
+
+        assert_eq!(parsed.events.len(), 1);
+        assert!(parsed.events[0].text.len() <= MESSAGE_TEXT_LIMIT + "[truncated]".len() + 1);
+        assert!(parsed.events[0].text.contains("[truncated]"));
     }
 }
