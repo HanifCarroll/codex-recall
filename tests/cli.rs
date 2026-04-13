@@ -542,3 +542,177 @@ fn index_reports_progress_for_larger_sources() {
     assert!(stderr.contains("eta"), "{stderr}");
     assert!(stderr.contains("current "), "{stderr}");
 }
+
+#[test]
+fn status_json_reports_pending_files_without_creating_missing_database() {
+    let temp = temp_dir("status-pending");
+    let source = temp.join("sessions");
+    let db = temp.join("missing").join("index.sqlite");
+    let state = temp.join("state.json");
+    write_sample_session(&source);
+
+    let status = Command::new(env!("CARGO_BIN_EXE_codex-recall"))
+        .args(["status", "--json", "--db"])
+        .arg(&db)
+        .args(["--state"])
+        .arg(&state)
+        .args(["--source"])
+        .arg(&source)
+        .output()
+        .unwrap();
+    assert!(
+        status.status.success(),
+        "status failed: {}",
+        String::from_utf8_lossy(&status.stderr)
+    );
+
+    let json: serde_json::Value = serde_json::from_slice(&status.stdout).unwrap();
+    assert_eq!(json["db_exists"], false);
+    assert_eq!(json["pending_files"], 1);
+    assert_eq!(json["last_error"], serde_json::Value::Null);
+    assert!(!db.exists(), "status should not create the database");
+}
+
+#[test]
+fn watch_once_indexes_stable_sessions_and_writes_status() {
+    let temp = temp_dir("watch-once");
+    let source = temp.join("sessions");
+    let db = temp.join("index.sqlite");
+    let state = temp.join("watch-state.json");
+    write_sample_session(&source);
+
+    let watch = Command::new(env!("CARGO_BIN_EXE_codex-recall"))
+        .args([
+            "watch",
+            "--once",
+            "--quiet-for",
+            "0",
+            "--interval",
+            "0",
+            "--db",
+        ])
+        .arg(&db)
+        .args(["--state"])
+        .arg(&state)
+        .args(["--source"])
+        .arg(&source)
+        .output()
+        .unwrap();
+    assert!(
+        watch.status.success(),
+        "watch failed: {}",
+        String::from_utf8_lossy(&watch.stderr)
+    );
+
+    let stdout = String::from_utf8_lossy(&watch.stdout);
+    assert!(stdout.contains("watch indexed"), "{stdout}");
+
+    let stats = Command::new(env!("CARGO_BIN_EXE_codex-recall"))
+        .args(["stats", "--db"])
+        .arg(&db)
+        .output()
+        .unwrap();
+    assert!(stats.status.success());
+    assert!(String::from_utf8_lossy(&stats.stdout).starts_with("1 sessions, 2 events"));
+
+    let json: serde_json::Value = serde_json::from_slice(&fs::read(&state).unwrap()).unwrap();
+    assert_eq!(json["pending_files"], 0);
+    assert_eq!(json["last_error"], serde_json::Value::Null);
+    assert_eq!(json["last_indexed_sessions"], 1);
+    assert!(json["last_run_at"].as_str().is_some());
+}
+
+#[test]
+fn watch_installs_launch_agent_plist_when_requested() {
+    let temp = temp_dir("watch-launch-agent");
+    let source = temp.join("sessions");
+    let db = temp.join("index.sqlite");
+    let state = temp.join("watch-state.json");
+    let agent = temp.join("com.example.codex-recall.watch.plist");
+    fs::create_dir_all(&source).unwrap();
+
+    let install = Command::new(env!("CARGO_BIN_EXE_codex-recall"))
+        .args([
+            "watch",
+            "--install-launch-agent",
+            "--agent-label",
+            "com.example.codex-recall.watch",
+            "--agent-path",
+        ])
+        .arg(&agent)
+        .args(["--db"])
+        .arg(&db)
+        .args(["--state"])
+        .arg(&state)
+        .args(["--source"])
+        .arg(&source)
+        .args(["--interval", "60", "--quiet-for", "5"])
+        .output()
+        .unwrap();
+    assert!(
+        install.status.success(),
+        "install failed: {}",
+        String::from_utf8_lossy(&install.stderr)
+    );
+
+    let plist = fs::read_to_string(&agent).unwrap();
+    assert!(plist.contains("<key>Label</key>"), "{plist}");
+    assert!(plist.contains("com.example.codex-recall.watch"), "{plist}");
+    assert!(plist.contains("<string>watch</string>"), "{plist}");
+    assert!(plist.contains("<string>--interval</string>"), "{plist}");
+    assert!(plist.contains("<string>60</string>"), "{plist}");
+    assert!(plist.contains(source.to_str().unwrap()), "{plist}");
+}
+
+#[test]
+fn bundle_outputs_agent_ready_context() {
+    let temp = temp_dir("bundle");
+    let source = temp.join("sessions");
+    let db = temp.join("index.sqlite");
+    write_session_file(
+        &source,
+        "revenuecat.jsonl",
+        "revenuecat",
+        "/Users/me/projects/payments",
+        "2026-04-13T01:00:00Z",
+        "The RevenueCat webhook secret was missing from production.",
+    );
+    write_session_file(
+        &source,
+        "stripe.jsonl",
+        "stripe",
+        "/Users/me/projects/payments",
+        "2026-04-13T02:00:00Z",
+        "Stripe retries were caused by the missing webhook secret.",
+    );
+
+    let index = Command::new(env!("CARGO_BIN_EXE_codex-recall"))
+        .args(["index", "--db"])
+        .arg(&db)
+        .args(["--source"])
+        .arg(&source)
+        .output()
+        .unwrap();
+    assert!(index.status.success());
+
+    let bundle = Command::new(env!("CARGO_BIN_EXE_codex-recall"))
+        .args(["bundle", "webhook secret", "--db"])
+        .arg(&db)
+        .args(["--limit", "2", "--repo", "payments"])
+        .output()
+        .unwrap();
+    assert!(
+        bundle.status.success(),
+        "bundle failed: {}",
+        String::from_utf8_lossy(&bundle.stderr)
+    );
+
+    let stdout = String::from_utf8_lossy(&bundle.stdout);
+    assert!(stdout.contains("# codex-recall bundle"), "{stdout}");
+    assert!(stdout.contains("Query: webhook secret"), "{stdout}");
+    assert!(stdout.contains("## Top Sessions"), "{stdout}");
+    assert!(stdout.contains("## Receipts"), "{stdout}");
+    assert!(stdout.contains("revenuecat"), "{stdout}");
+    assert!(stdout.contains("stripe"), "{stdout}");
+    assert!(stdout.contains("codex-recall show"), "{stdout}");
+}

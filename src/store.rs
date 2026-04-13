@@ -111,7 +111,7 @@ impl Store {
         }
 
         let conn = Connection::open(path).with_context(|| format!("open db {}", path.display()))?;
-        conn.busy_timeout(Duration::from_secs(5))?;
+        conn.busy_timeout(Duration::from_secs(30))?;
         let store = Self { conn };
         store.init_schema()?;
         Ok(store)
@@ -121,7 +121,7 @@ impl Store {
         let path = path.as_ref();
         let conn = Connection::open_with_flags(path, OpenFlags::SQLITE_OPEN_READ_ONLY)
             .with_context(|| format!("open db read-only {}", path.display()))?;
-        conn.busy_timeout(Duration::from_secs(5))?;
+        conn.busy_timeout(Duration::from_secs(30))?;
         Ok(Self { conn })
     }
 
@@ -464,6 +464,14 @@ impl Store {
             ],
         )?;
         Ok(())
+    }
+
+    pub fn last_indexed_at(&self) -> Result<Option<String>> {
+        self.conn
+            .query_row("SELECT MAX(indexed_at) FROM ingestion_state", [], |row| {
+                row.get::<_, Option<String>>(0)
+            })
+            .map_err(Into::into)
     }
 
     fn init_schema(&self) -> Result<()> {

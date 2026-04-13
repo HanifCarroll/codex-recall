@@ -18,11 +18,16 @@ Raw JSONL files remain the source of truth.
 ```bash
 codex-recall index
 codex-recall rebuild
+codex-recall watch
+codex-recall watch --once
+codex-recall status
+codex-recall status --json
 codex-recall search "Stripe webhook"
 codex-recall search "Stripe webhook" --repo palabruno --since 2026-04-01
 codex-recall search "Stripe webhook" --since 7d
 codex-recall search "Stripe webhook" --cwd projects/palabruno
 codex-recall search "Stripe webhook" --json
+codex-recall bundle "Stripe webhook" --repo palabruno --since 14d
 codex-recall show <session-id-or-session-key>
 codex-recall doctor --json
 codex-recall stats
@@ -32,6 +37,8 @@ Useful flags:
 
 ```bash
 codex-recall index --db /tmp/index.sqlite --source ~/.codex/sessions/2026/04
+codex-recall watch --interval 30 --quiet-for 5
+codex-recall watch --install-launch-agent
 codex-recall search "source-map" --limit 5
 codex-recall search "source-map" --all-repos
 codex-recall show <session-key> --limit 20
@@ -53,7 +60,11 @@ codex-recall show <session-key> --limit 20
 - Boosts results from the current git repo by default. Use `--repo` to filter to a repo, or `--all-repos` to disable the current-repo boost.
 - Tracks file size and mtime so repeat indexing skips unchanged sessions.
 - Reports indexing progress to stderr with discovered file totals, bytes processed, elapsed time, ETA, current file, and skipped-file reason counts.
+- Watches session roots with a polling freshness loop, waits for files to be quiet before indexing, and records watcher state in `~/.local/state/codex-recall/watch.json`.
+- Reports freshness status with pending file counts, stable/waiting file counts, last indexed time, and the last watcher error.
+- Can write a macOS LaunchAgent plist for the watcher with `watch --install-launch-agent`.
 - Groups text search output by session, with the best receipts under each session.
+- Formats search results into an agent-ready context bundle with top sessions, receipts, and follow-up `show` commands.
 - Ranks sessions by current-repo match, hit count, event kind, FTS rank, and recency.
 - Reports source-file counts and duplicate source-file counts in `stats`.
 - Keeps `--json` output compact by returning `text_preview` instead of full transcript blobs.
@@ -74,6 +85,21 @@ Use `rebuild` when the disposable SQLite index should be recreated from the raw 
 
 ```bash
 codex-recall rebuild
+```
+
+Use `watch` when the index should stay fresh while Codex or Hermes writes new transcripts:
+
+```bash
+codex-recall watch
+codex-recall status
+```
+
+`watch --install-launch-agent` writes a plist to `~/Library/LaunchAgents/com.hanif.codex-recall.watch.plist` and prints the `launchctl bootstrap` command to start it.
+
+Use `bundle` when an agent needs compact prior-session context:
+
+```bash
+codex-recall bundle "Hermes global skills" --since 14d --limit 5
 ```
 
 ## Local Verification

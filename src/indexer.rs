@@ -4,7 +4,7 @@ use anyhow::{Context, Result};
 use std::fs;
 use std::io::ErrorKind;
 use std::path::{Path, PathBuf};
-use std::time::UNIX_EPOCH;
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct IndexReport {
@@ -21,8 +21,75 @@ pub struct IndexReport {
     pub current_file: Option<PathBuf>,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SourceScanReport {
+    pub files_total: usize,
+    pub pending_files: usize,
+    pub pending_bytes: u64,
+    pub stable_pending_files: usize,
+    pub waiting_files: usize,
+    pub missing_sources: Vec<PathBuf>,
+}
+
 pub fn index_sources(store: &Store, sources: &[PathBuf]) -> Result<IndexReport> {
     index_sources_with_progress(store, sources, |_| {})
+}
+
+pub fn scan_sources_for_pending(
+    store: Option<&Store>,
+    sources: &[PathBuf],
+    quiet_for: Duration,
+) -> Result<SourceScanReport> {
+    let now = SystemTime::now();
+    let mut report = SourceScanReport {
+        files_total: 0,
+        pending_files: 0,
+        pending_bytes: 0,
+        stable_pending_files: 0,
+        waiting_files: 0,
+        missing_sources: Vec::new(),
+    };
+
+    for source in sources {
+        if !source.exists() {
+            report.missing_sources.push(source.clone());
+            continue;
+        }
+
+        for path in jsonl_files(source)? {
+            report.files_total += 1;
+            let file_state = match FileState::from_path(&path) {
+                Ok(file_state) => file_state,
+                Err(error) if is_not_found_error(&error) => continue,
+                Err(error) => return Err(error),
+            };
+            let is_current = if let Some(store) = store {
+                store.is_source_current(
+                    &path,
+                    file_state.source_file_mtime_ns,
+                    file_state.source_file_size,
+                )?
+            } else {
+                false
+            };
+
+            if is_current {
+                continue;
+            }
+
+            report.pending_files += 1;
+            report.pending_bytes = report
+                .pending_bytes
+                .saturating_add(file_state.source_file_size as u64);
+            if is_stable(now, file_state.modified, quiet_for) {
+                report.stable_pending_files += 1;
+            } else {
+                report.waiting_files += 1;
+            }
+        }
+    }
+
+    Ok(report)
 }
 
 pub fn index_sources_with_progress<F>(
@@ -57,7 +124,6 @@ where
 
     for path in files {
         report.current_file = Some(path.clone());
-        on_progress(&report);
 
         let file_state = match FileState::from_path(&path) {
             Ok(file_state) => file_state,
@@ -89,6 +155,8 @@ where
             }
             continue;
         }
+
+        on_progress(&report);
 
         let parsed = match parse_session_file(&path) {
             Ok(parsed) => parsed,
@@ -153,6 +221,7 @@ fn total_known_bytes(files: &[PathBuf]) -> u64 {
 struct FileState {
     source_file_mtime_ns: i64,
     source_file_size: i64,
+    modified: SystemTime,
 }
 
 impl FileState {
@@ -170,8 +239,16 @@ impl FileState {
         Ok(Self {
             source_file_mtime_ns,
             source_file_size,
+            modified,
         })
     }
+}
+
+fn is_stable(now: SystemTime, modified: SystemTime, quiet_for: Duration) -> bool {
+    quiet_for.is_zero()
+        || now
+            .duration_since(modified)
+            .is_ok_and(|age| age >= quiet_for)
 }
 
 fn is_not_found_error(error: &anyhow::Error) -> bool {
