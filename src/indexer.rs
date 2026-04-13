@@ -218,6 +218,38 @@ fn total_known_bytes(files: &[PathBuf]) -> u64 {
         .sum()
 }
 
+fn jsonl_files(root: &Path) -> Result<Vec<PathBuf>> {
+    let mut files = Vec::new();
+    collect_jsonl_files(root, &mut files)?;
+    files.sort();
+    Ok(files)
+}
+
+fn collect_jsonl_files(path: &Path, files: &mut Vec<PathBuf>) -> Result<()> {
+    if !path.exists() {
+        return Ok(());
+    }
+
+    if path.is_file() {
+        if path.extension().and_then(|ext| ext.to_str()) == Some("jsonl") {
+            files.push(path.to_path_buf());
+        }
+        return Ok(());
+    }
+
+    for entry in fs::read_dir(path)? {
+        let entry = entry?;
+        let path = entry.path();
+        if path.is_dir() {
+            collect_jsonl_files(&path, files)?;
+        } else if path.extension().and_then(|ext| ext.to_str()) == Some("jsonl") {
+            files.push(path);
+        }
+    }
+
+    Ok(())
+}
+
 struct FileState {
     source_file_mtime_ns: i64,
     source_file_size: i64,
@@ -364,36 +396,4 @@ mod tests {
 
         assert!(saw_current_before_index);
     }
-}
-
-fn jsonl_files(root: &Path) -> Result<Vec<PathBuf>> {
-    let mut files = Vec::new();
-    collect_jsonl_files(root, &mut files)?;
-    files.sort();
-    Ok(files)
-}
-
-fn collect_jsonl_files(path: &Path, files: &mut Vec<PathBuf>) -> Result<()> {
-    if !path.exists() {
-        return Ok(());
-    }
-
-    if path.is_file() {
-        if path.extension().and_then(|ext| ext.to_str()) == Some("jsonl") {
-            files.push(path.to_path_buf());
-        }
-        return Ok(());
-    }
-
-    for entry in fs::read_dir(path)? {
-        let entry = entry?;
-        let path = entry.path();
-        if path.is_dir() {
-            collect_jsonl_files(&path, files)?;
-        } else if path.extension().and_then(|ext| ext.to_str()) == Some("jsonl") {
-            files.push(path);
-        }
-    }
-
-    Ok(())
 }

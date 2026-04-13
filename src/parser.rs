@@ -5,6 +5,7 @@ use std::collections::HashSet;
 use std::fs::File;
 use std::io::{BufRead, BufReader};
 use std::path::{Path, PathBuf};
+use std::str::FromStr;
 
 const COMMAND_OUTPUT_LIMIT: usize = 4_000;
 const COMMAND_OUTPUT_REDACTION_WINDOW: usize = COMMAND_OUTPUT_LIMIT + 512;
@@ -56,13 +57,21 @@ impl EventKind {
         }
     }
 
-    pub fn from_str(value: &str) -> Option<Self> {
+    fn parse_kind(value: &str) -> Option<Self> {
         match value {
             "user_message" => Some(EventKind::UserMessage),
             "assistant_message" => Some(EventKind::AssistantMessage),
             "command" => Some(EventKind::Command),
             _ => None,
         }
+    }
+}
+
+impl FromStr for EventKind {
+    type Err = ();
+
+    fn from_str(value: &str) -> std::result::Result<Self, Self::Err> {
+        Self::parse_kind(value).ok_or(())
     }
 }
 

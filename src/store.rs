@@ -203,8 +203,8 @@ impl Store {
             return Ok(Vec::new());
         }
 
-        let limit = options.limit.max(1).min(100);
-        let fetch_limit = limit.saturating_mul(50).max(200).min(1_000);
+        let limit = options.limit.clamp(1, 100);
+        let fetch_limit = limit.saturating_mul(50).clamp(200, 1_000);
         let results = self.search_with_fts_query(&options, &and_fts_query(&terms), fetch_limit)?;
         if !results.is_empty() || terms.len() == 1 {
             return Ok(rank_search_results(
@@ -303,7 +303,7 @@ impl Store {
 
         let rows = statement.query_map(params_from_iter(query_params.iter()), |row| {
             let kind_text: String = row.get(3)?;
-            let kind = EventKind::from_str(&kind_text).ok_or_else(|| {
+            let kind = kind_text.parse::<EventKind>().map_err(|_| {
                 rusqlite::Error::InvalidColumnType(
                     3,
                     "kind".to_owned(),
@@ -359,7 +359,7 @@ impl Store {
     }
 
     pub fn session_events(&self, session_key: &str, limit: usize) -> Result<Vec<SessionEvent>> {
-        let limit = limit.max(1).min(500);
+        let limit = limit.clamp(1, 500);
         let mut statement = self.conn.prepare(
             r#"
             SELECT
@@ -381,7 +381,7 @@ impl Store {
 
         let rows = statement.query_map(params![session_key, limit as i64], |row| {
             let kind_text: String = row.get(2)?;
-            let kind = EventKind::from_str(&kind_text).ok_or_else(|| {
+            let kind = kind_text.parse::<EventKind>().map_err(|_| {
                 rusqlite::Error::InvalidColumnType(
                     2,
                     "kind".to_owned(),
@@ -1144,7 +1144,7 @@ fn and_fts_query(terms: &[String]) -> String {
 
 fn or_fts_query(terms: &[String]) -> String {
     terms
-        .into_iter()
+        .iter()
         .map(|term| quote_fts_term(term))
         .collect::<Vec<_>>()
         .join(" OR ")

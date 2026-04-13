@@ -115,6 +115,40 @@ fn index_then_search_outputs_ranked_receipts() {
 }
 
 #[test]
+fn cli_supports_top_level_version_flag() {
+    let version = Command::new(env!("CARGO_BIN_EXE_codex-recall"))
+        .arg("--version")
+        .output()
+        .unwrap();
+    assert!(
+        version.status.success(),
+        "version failed: {}",
+        String::from_utf8_lossy(&version.stderr)
+    );
+    assert!(
+        String::from_utf8_lossy(&version.stdout).contains(env!("CARGO_PKG_VERSION")),
+        "{}",
+        String::from_utf8_lossy(&version.stdout)
+    );
+}
+
+#[test]
+fn subcommand_help_lists_typed_flags() {
+    let help = Command::new(env!("CARGO_BIN_EXE_codex-recall"))
+        .args(["watch", "--help"])
+        .output()
+        .unwrap();
+    assert!(
+        help.status.success(),
+        "help failed: {}",
+        String::from_utf8_lossy(&help.stderr)
+    );
+    let stdout = String::from_utf8_lossy(&help.stdout);
+    assert!(stdout.contains("--quiet-for"), "{stdout}");
+    assert!(stdout.contains("--install-launch-agent"), "{stdout}");
+}
+
+#[test]
 fn search_json_outputs_machine_readable_receipts() {
     let temp = temp_dir("search-json");
     let source = temp.join("sessions");
