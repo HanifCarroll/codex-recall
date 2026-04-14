@@ -25,10 +25,13 @@ codex-recall status
 codex-recall status --json
 codex-recall search "Stripe webhook"
 codex-recall search "Stripe webhook" --repo palabruno --since 2026-04-01
+codex-recall search "Stripe webhook" --from 2026-04-01 --until 2026-04-14
 codex-recall search "Stripe webhook" --since 7d
 codex-recall search "Stripe webhook" --cwd projects/palabruno
+codex-recall search "Stripe webhook" --exclude-session <session-id-or-session-key>
 codex-recall search "Stripe webhook" --json
 codex-recall recent --repo palabruno --since 7d
+codex-recall recent --from 2026-04-13 --until 2026-04-14
 codex-recall bundle "Stripe webhook" --repo palabruno --since 14d
 codex-recall show <session-id-or-session-key>
 codex-recall pin <session-key> --label "watcher design"
@@ -48,6 +51,7 @@ codex-recall watch --install-launch-agent
 codex-recall watch --install-launch-agent --start-launch-agent
 codex-recall search "source-map" --limit 5
 codex-recall search "source-map" --all-repos
+codex-recall search "source-map" --include-duplicates
 codex-recall recent --limit 10
 codex-recall show <session-key> --limit 20
 codex-recall pin <session-key> --label "canonical decision" --pins /tmp/pins.json
@@ -61,11 +65,14 @@ codex-recall unpin <session-key> --pins /tmp/pins.json
 - Skips Codex instruction preambles such as `AGENTS.md` and environment context blocks.
 - Deduplicates exact duplicate transcript events.
 - Keeps exact source provenance as `path:line`.
-- Stores a stable `session_key` derived from `session_id + source_file_path`, so duplicate active/archive transcripts do not collapse.
+- Stores a stable `session_key` derived from `session_id + source_file_path`.
+- Deduplicates active/archive copies by `session_id` in `search`, `recent`, and `bundle` by default, preferring active `sessions` files over `archived_sessions` files. Use `--include-duplicates` to inspect every indexed source copy.
 - Uses SQLite FTS5 with safe query normalization, so punctuation-heavy queries like `source-map` work.
 - Falls back to matching any query term when no single event contains every term.
-- Supports search filters by repo slug, cwd substring, and session start date. Repo matching uses both the session cwd and command cwd values seen inside the session.
+- Supports search filters by repo slug, cwd substring, session start date, and explicit excluded sessions. Repo matching uses both the session cwd and command cwd values seen inside the session.
 - Accepts absolute `--since` dates plus relative values like `7d`, `30d`, `today`, and `yesterday`.
+- Accepts `--from` as an explicit lower bound and `--until` as an exclusive upper bound. Use `--from 2026-04-13 --until 2026-04-14` for the local calendar day of April 13.
+- Rejects `--since` and `--from` together because both are lower bounds.
 - Interprets `today` and `yesterday` using the local day boundary, then compares against UTC transcript timestamps.
 - Boosts results from the current git repo by default. Use `--repo` to filter to a repo, or `--all-repos` to disable the current-repo boost.
 - Tracks file size and mtime so repeat indexing skips unchanged sessions.
@@ -83,6 +90,8 @@ codex-recall unpin <session-key> --pins /tmp/pins.json
 - Reports source-file counts and duplicate source-file counts in `stats`.
 - Keeps `--json` output compact by returning `text_preview` instead of full transcript blobs.
 - Separates progress and diagnostics onto stderr so `--json` output stays pipe-safe.
+- Opens read-only commands without running schema migrations, so `search`, `recent`, `bundle`, `show`, `doctor`, and `stats` do not create missing databases or take writer locks.
+- Uses SQLite WAL mode, a 30-second busy timeout, and normal synchronous writes for better behavior when the watcher and read commands overlap.
 
 ## Maintenance
 
@@ -116,12 +125,14 @@ Use `bundle` when an agent needs compact prior-session context:
 
 ```bash
 codex-recall bundle "Hermes global skills" --since 14d --limit 5
+codex-recall bundle "Hermes global skills" --from 2026-04-13 --until 2026-04-14 --limit 5
 ```
 
 Use `recent` when you do not know the right query yet:
 
 ```bash
 codex-recall recent --repo codex-recall --since 7d --limit 10
+codex-recall recent --repo codex-recall --from 2026-04-13 --until 2026-04-14 --limit 10
 ```
 
 Use `pin` after finding a high-value session that should be easy to return to:
@@ -142,13 +153,16 @@ When an agent needs prior-session context:
 3. If `freshness` is `stale`, run `codex-recall watch --once --quiet-for 0` or `codex-recall index`, then check `status --json` again.
 4. If `freshness` is `watcher-not-running`, start the background watcher with `codex-recall watch --install-launch-agent --start-launch-agent`, then run `codex-recall watch --once --quiet-for 0` for an immediate catch-up.
 5. Use `codex-recall recent --repo <repo> --since 7d --limit 10` when you do not know the right search terms yet.
-6. Use `codex-recall bundle "<query>" --repo <repo> --since 30d --limit 5` for compact context.
-7. Use `codex-recall search "<query>" --json` when programmatic filtering is needed.
-8. Use `codex-recall show <session_key>` only for sessions that look relevant from `bundle`, `search`, or `recent`.
-9. Use `codex-recall pin <session_key> --label "<why this matters>"` for canonical decisions or sessions that are likely to be reused.
-10. Use `codex-recall pins --json` when scripts or agents need stable pin data.
-11. Use `codex-recall unpin <session_key>` when a memory anchor is stale or mistaken.
-12. Treat transcript evidence as historical. Verify against the current repo before acting.
+6. For calendar-day review, prefer half-open date windows: `codex-recall recent --from YYYY-MM-DD --until YYYY-MM-DD --limit 50`, where `--until` is the next calendar date.
+7. Use `codex-recall bundle "<query>" --repo <repo> --from YYYY-MM-DD --until YYYY-MM-DD --limit 5` for compact context.
+8. Use `codex-recall search "<query>" --json --from YYYY-MM-DD --until YYYY-MM-DD` when programmatic filtering is needed.
+9. Add `--exclude-session <session-id-or-session-key>` when the current automation/session id is known, so self-references do not pollute evidence.
+10. Keep the default deduped view unless the question is specifically about active/archive divergence. Use `--include-duplicates` only for that inspection.
+11. Use `codex-recall show <session_key>` only for sessions that look relevant from `bundle`, `search`, or `recent`.
+12. Use `codex-recall pin <session_key> --label "<why this matters>"` for canonical decisions or sessions that are likely to be reused.
+13. Use `codex-recall pins --json` when scripts or agents need stable pin data.
+14. Use `codex-recall unpin <session_key>` when a memory anchor is stale or mistaken.
+15. Treat transcript evidence as historical. Verify against the current repo before acting.
 
 ## Local Verification
 

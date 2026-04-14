@@ -116,7 +116,20 @@ fn keeps_duplicate_session_ids_by_source_file() {
     assert_eq!(stats.session_count, 2);
     assert_eq!(stats.event_count, 4);
 
-    let results = store.search("webhook secret", 10).unwrap();
+    let results = store
+        .search_with_options(SearchOptions {
+            query: "webhook secret".to_owned(),
+            limit: 10,
+            repo: None,
+            cwd: None,
+            since: None,
+            from: None,
+            until: None,
+            include_duplicates: true,
+            exclude_sessions: Vec::new(),
+            current_repo: None,
+        })
+        .unwrap();
     let mut keys = results
         .iter()
         .map(|result| result.session_key.as_str())
@@ -157,6 +170,10 @@ fn ranks_current_repo_sessions_before_other_repos() {
             repo: None,
             cwd: None,
             since: None,
+            from: None,
+            until: None,
+            include_duplicates: false,
+            exclude_sessions: Vec::new(),
             current_repo: Some("project".to_owned()),
         })
         .unwrap();
@@ -204,6 +221,10 @@ fn ranks_current_repo_when_only_a_command_ran_inside_that_repo() {
             repo: None,
             cwd: None,
             since: None,
+            from: None,
+            until: None,
+            include_duplicates: false,
+            exclude_sessions: Vec::new(),
             current_repo: Some("project".to_owned()),
         })
         .unwrap();
@@ -247,6 +268,10 @@ fn filters_search_by_repo_cwd_and_since() {
             repo: Some("palabruno".to_owned()),
             cwd: Some("projects/palabruno".to_owned()),
             since: Some("2026-04-10".to_owned()),
+            from: None,
+            until: None,
+            include_duplicates: false,
+            exclude_sessions: Vec::new(),
             current_repo: None,
         })
         .unwrap();

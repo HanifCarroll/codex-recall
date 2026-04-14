@@ -1,7 +1,7 @@
 use crate::parser::{EventKind, ParsedSession};
-use anyhow::{Context, Result};
+use anyhow::{bail, Context, Result};
 use rusqlite::{params, params_from_iter, Connection, OpenFlags};
-use std::collections::{BTreeSet, HashMap};
+use std::collections::{hash_map::Entry, BTreeSet, HashMap};
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 
@@ -43,6 +43,10 @@ pub struct SearchOptions {
     pub repo: Option<String>,
     pub cwd: Option<String>,
     pub since: Option<String>,
+    pub from: Option<String>,
+    pub until: Option<String>,
+    pub include_duplicates: bool,
+    pub exclude_sessions: Vec<String>,
     pub current_repo: Option<String>,
 }
 
@@ -54,6 +58,10 @@ impl SearchOptions {
             repo: None,
             cwd: None,
             since: None,
+            from: None,
+            until: None,
+            include_duplicates: false,
+            exclude_sessions: Vec::new(),
             current_repo: None,
         }
     }
@@ -96,6 +104,10 @@ pub struct RecentOptions {
     pub repo: Option<String>,
     pub cwd: Option<String>,
     pub since: Option<String>,
+    pub from: Option<String>,
+    pub until: Option<String>,
+    pub include_duplicates: bool,
+    pub exclude_sessions: Vec<String>,
 }
 
 impl Default for RecentOptions {
@@ -105,6 +117,10 @@ impl Default for RecentOptions {
             repo: None,
             cwd: None,
             since: None,
+            from: None,
+            until: None,
+            include_duplicates: false,
+            exclude_sessions: Vec::new(),
         }
     }
 }
@@ -140,7 +156,7 @@ impl Store {
         }
 
         let conn = Connection::open(path).with_context(|| format!("open db {}", path.display()))?;
-        conn.busy_timeout(Duration::from_secs(30))?;
+        configure_write_connection(&conn)?;
         let store = Self { conn };
         store.init_schema()?;
         Ok(store)
@@ -150,7 +166,7 @@ impl Store {
         let path = path.as_ref();
         let conn = Connection::open_with_flags(path, OpenFlags::SQLITE_OPEN_READ_ONLY)
             .with_context(|| format!("open db read-only {}", path.display()))?;
-        conn.busy_timeout(Duration::from_secs(30))?;
+        configure_read_connection(&conn)?;
         Ok(Self { conn })
     }
 
@@ -240,6 +256,7 @@ impl Store {
                 results,
                 options.current_repo.as_deref(),
                 limit,
+                options.include_duplicates,
             ));
         }
 
@@ -248,6 +265,7 @@ impl Store {
             results,
             options.current_repo.as_deref(),
             limit,
+            options.include_duplicates,
         ))
     }
 
@@ -321,9 +339,14 @@ impl Store {
             query_params.push(cwd.clone());
             query_params.push(cwd.clone());
         }
-        if let Some(since) = &options.since {
-            append_since_clause(&mut sql, &mut query_params, since)?;
-        }
+        append_from_until_clauses(
+            &mut sql,
+            &mut query_params,
+            options.since.as_ref(),
+            options.from.as_ref(),
+            options.until.as_ref(),
+        )?;
+        append_excluded_sessions_clause(&mut sql, &mut query_params, &options.exclude_sessions);
 
         sql.push_str(" ORDER BY events_fts.rank ASC, events.source_line_number ASC LIMIT ");
         sql.push_str(&limit.to_string());
@@ -389,6 +412,11 @@ impl Store {
 
     pub fn recent_sessions(&self, options: RecentOptions) -> Result<Vec<RecentSession>> {
         let limit = options.limit.clamp(1, 100);
+        let fetch_limit = if options.include_duplicates {
+            limit
+        } else {
+            limit.saturating_mul(5).clamp(limit, 500)
+        };
         let mut query_params = Vec::<String>::new();
         let mut sql = r#"
             SELECT
@@ -431,9 +459,14 @@ impl Store {
             query_params.push(cwd.clone());
             query_params.push(cwd.clone());
         }
-        if let Some(since) = &options.since {
-            append_since_clause(&mut sql, &mut query_params, since)?;
-        }
+        append_from_until_clauses(
+            &mut sql,
+            &mut query_params,
+            options.since.as_ref(),
+            options.from.as_ref(),
+            options.until.as_ref(),
+        )?;
+        append_excluded_sessions_clause(&mut sql, &mut query_params, &options.exclude_sessions);
 
         sql.push_str(
             r#"
@@ -442,7 +475,7 @@ impl Store {
             LIMIT ?
             "#,
         );
-        query_params.push(limit.to_string());
+        query_params.push(fetch_limit.to_string());
 
         let mut statement = self.conn.prepare(&sql)?;
         let rows = statement.query_map(params_from_iter(query_params.iter()), |row| {
@@ -457,8 +490,12 @@ impl Store {
             })
         })?;
 
-        rows.collect::<std::result::Result<Vec<_>, _>>()
-            .map_err(Into::into)
+        let mut sessions = rows.collect::<std::result::Result<Vec<_>, _>>()?;
+        if !options.include_duplicates {
+            sessions = dedupe_recent_sessions(sessions);
+        }
+        sessions.truncate(limit);
+        Ok(sessions)
     }
 
     pub fn session_events(&self, session_key: &str, limit: usize) -> Result<Vec<SessionEvent>> {
@@ -1056,6 +1093,29 @@ impl Store {
     }
 }
 
+fn configure_write_connection(conn: &Connection) -> Result<()> {
+    conn.busy_timeout(Duration::from_secs(30))?;
+    conn.execute_batch(
+        r#"
+        PRAGMA journal_mode = WAL;
+        PRAGMA synchronous = NORMAL;
+        PRAGMA temp_store = MEMORY;
+        "#,
+    )?;
+    Ok(())
+}
+
+fn configure_read_connection(conn: &Connection) -> Result<()> {
+    conn.busy_timeout(Duration::from_secs(30))?;
+    conn.execute_batch(
+        r#"
+        PRAGMA query_only = ON;
+        PRAGMA temp_store = MEMORY;
+        "#,
+    )?;
+    Ok(())
+}
+
 enum SinceFilter {
     Absolute(String),
     LastDays(u32),
@@ -1063,7 +1123,7 @@ enum SinceFilter {
     Yesterday,
 }
 
-fn parse_since_filter(value: &str) -> Result<SinceFilter> {
+fn parse_date_filter(value: &str, flag_name: &str) -> Result<SinceFilter> {
     let trimmed = value.trim();
     let lower = trimmed.to_ascii_lowercase();
     if lower == "today" {
@@ -1075,7 +1135,7 @@ fn parse_since_filter(value: &str) -> Result<SinceFilter> {
     if let Some(days) = lower.strip_suffix('d') {
         let days = days
             .parse::<u32>()
-            .with_context(|| format!("parse --since relative day value `{value}`"))?;
+            .with_context(|| format!("parse {flag_name} relative day value `{value}`"))?;
         if days == 0 {
             return Ok(SinceFilter::Today);
         }
@@ -1086,7 +1146,7 @@ fn parse_since_filter(value: &str) -> Result<SinceFilter> {
     }
 
     anyhow::bail!(
-        "unsupported --since value `{value}`; use YYYY-MM-DD, today, yesterday, or Nd like 7d"
+        "unsupported {flag_name} value `{value}`; use YYYY-MM-DD, today, yesterday, or Nd like 7d"
     )
 }
 
@@ -1105,10 +1165,19 @@ fn append_since_clause(
     query_params: &mut Vec<String>,
     value: &str,
 ) -> Result<()> {
+    append_lower_bound_clause(sql, query_params, value, "--since")
+}
+
+fn append_lower_bound_clause(
+    sql: &mut String,
+    query_params: &mut Vec<String>,
+    value: &str,
+    flag_name: &str,
+) -> Result<()> {
     sql.push_str(
         " AND datetime(replace(replace(sessions.session_timestamp, 'T', ' '), 'Z', '')) >= ",
     );
-    match parse_since_filter(value)? {
+    match parse_date_filter(value, flag_name)? {
         SinceFilter::Absolute(value) => {
             sql.push_str("datetime(?)");
             query_params.push(value);
@@ -1127,8 +1196,70 @@ fn append_since_clause(
     Ok(())
 }
 
+fn append_until_clause(
+    sql: &mut String,
+    query_params: &mut Vec<String>,
+    value: &str,
+) -> Result<()> {
+    sql.push_str(
+        " AND datetime(replace(replace(sessions.session_timestamp, 'T', ' '), 'Z', '')) < ",
+    );
+    match parse_date_filter(value, "--until")? {
+        SinceFilter::Absolute(value) => {
+            sql.push_str("datetime(?)");
+            query_params.push(value);
+        }
+        SinceFilter::LastDays(days) => {
+            sql.push_str("datetime('now', ?)");
+            query_params.push(format!("-{days} days"));
+        }
+        SinceFilter::Today => {
+            sql.push_str("datetime('now', 'localtime', 'start of day', 'utc')");
+        }
+        SinceFilter::Yesterday => {
+            sql.push_str("datetime('now', 'localtime', 'start of day', '-1 day', 'utc')");
+        }
+    }
+    Ok(())
+}
+
+fn append_from_until_clauses(
+    sql: &mut String,
+    query_params: &mut Vec<String>,
+    since: Option<&String>,
+    from: Option<&String>,
+    until: Option<&String>,
+) -> Result<()> {
+    if since.is_some() && from.is_some() {
+        bail!("use either --since or --from, not both");
+    }
+    if let Some(since) = since {
+        append_since_clause(sql, query_params, since)?;
+    } else if let Some(from) = from {
+        append_lower_bound_clause(sql, query_params, from, "--from")?;
+    }
+    if let Some(until) = until {
+        append_until_clause(sql, query_params, until)?;
+    }
+    Ok(())
+}
+
+fn append_excluded_sessions_clause(
+    sql: &mut String,
+    query_params: &mut Vec<String>,
+    excluded_sessions: &[String],
+) {
+    for excluded_session in excluded_sessions {
+        sql.push_str(" AND sessions.session_id != ? AND sessions.session_key != ?");
+        query_params.push(excluded_session.clone());
+        query_params.push(excluded_session.clone());
+    }
+}
+
 struct SessionGroup {
     session_key: String,
+    session_id: String,
+    source_file_path: PathBuf,
     repo_matches_current: bool,
     hit_count: usize,
     best_score: f64,
@@ -1141,6 +1272,7 @@ fn rank_search_results(
     results: Vec<SearchResult>,
     _current_repo: Option<&str>,
     limit: usize,
+    include_duplicates: bool,
 ) -> Vec<SearchResult> {
     let mut groups = Vec::<SessionGroup>::new();
 
@@ -1157,6 +1289,8 @@ fn rank_search_results(
         } else {
             groups.push(SessionGroup {
                 session_key: result.session_key.clone(),
+                session_id: result.session_id.clone(),
+                source_file_path: result.source_file_path.clone(),
                 repo_matches_current: result.repo_matches_current,
                 hit_count: 1,
                 best_score: result.score,
@@ -1165,6 +1299,10 @@ fn rank_search_results(
                 results: vec![result],
             });
         }
+    }
+
+    if !include_duplicates {
+        groups = dedupe_session_groups(groups);
     }
 
     groups.sort_by(|left, right| {
@@ -1199,6 +1337,95 @@ fn rank_search_results(
     }
 
     ranked
+}
+
+fn dedupe_session_groups(groups: Vec<SessionGroup>) -> Vec<SessionGroup> {
+    let mut selected = HashMap::<String, SessionGroup>::new();
+    for group in groups {
+        match selected.entry(group.session_id.clone()) {
+            Entry::Occupied(mut entry) => {
+                if is_preferred_group(&group, entry.get()) {
+                    entry.insert(group);
+                }
+            }
+            Entry::Vacant(entry) => {
+                entry.insert(group);
+            }
+        }
+    }
+    selected.into_values().collect()
+}
+
+fn is_preferred_group(candidate: &SessionGroup, current: &SessionGroup) -> bool {
+    let candidate_priority = source_priority(&candidate.source_file_path);
+    let current_priority = source_priority(&current.source_file_path);
+    candidate_priority < current_priority
+        || (candidate_priority == current_priority
+            && candidate.repo_matches_current
+            && !current.repo_matches_current)
+        || (candidate_priority == current_priority
+            && candidate.repo_matches_current == current.repo_matches_current
+            && candidate.session_timestamp > current.session_timestamp)
+        || (candidate_priority == current_priority
+            && candidate.repo_matches_current == current.repo_matches_current
+            && candidate.session_timestamp == current.session_timestamp
+            && candidate.session_key < current.session_key)
+}
+
+fn dedupe_recent_sessions(sessions: Vec<RecentSession>) -> Vec<RecentSession> {
+    let mut selected = HashMap::<String, RecentSession>::new();
+    for session in sessions {
+        match selected.entry(session.session_id.clone()) {
+            Entry::Occupied(mut entry) => {
+                if is_preferred_recent_session(&session, entry.get()) {
+                    entry.insert(session);
+                }
+            }
+            Entry::Vacant(entry) => {
+                entry.insert(session);
+            }
+        }
+    }
+
+    let mut sessions = selected.into_values().collect::<Vec<_>>();
+    sessions.sort_by(|left, right| {
+        right
+            .session_timestamp
+            .cmp(&left.session_timestamp)
+            .then_with(|| {
+                source_priority(&left.source_file_path)
+                    .cmp(&source_priority(&right.source_file_path))
+            })
+            .then_with(|| left.session_key.cmp(&right.session_key))
+    });
+    sessions
+}
+
+fn is_preferred_recent_session(candidate: &RecentSession, current: &RecentSession) -> bool {
+    let candidate_priority = source_priority(&candidate.source_file_path);
+    let current_priority = source_priority(&current.source_file_path);
+    candidate_priority < current_priority
+        || (candidate_priority == current_priority
+            && candidate.session_timestamp > current.session_timestamp)
+        || (candidate_priority == current_priority
+            && candidate.session_timestamp == current.session_timestamp
+            && candidate.session_key < current.session_key)
+}
+
+fn source_priority(path: &Path) -> u8 {
+    if path
+        .components()
+        .any(|component| component.as_os_str() == "archived_sessions")
+    {
+        return 2;
+    }
+    if path
+        .components()
+        .any(|component| component.as_os_str() == "sessions")
+    {
+        return 0;
+    }
+    1
 }
 
 fn event_kind_weight(kind: EventKind) -> u8 {

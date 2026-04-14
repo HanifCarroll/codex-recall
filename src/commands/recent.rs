@@ -17,6 +17,17 @@ pub struct RecentArgs {
     pub cwd: Option<String>,
     #[arg(long, help = "Restrict by age, for example 7d, today, or 2026-04-01")]
     pub since: Option<String>,
+    #[arg(long, help = "Restrict to sessions at or after this date/time")]
+    pub from: Option<String>,
+    #[arg(long, help = "Restrict to sessions before this date/time")]
+    pub until: Option<String>,
+    #[arg(long, help = "Include duplicate active/archive copies")]
+    pub include_duplicates: bool,
+    #[arg(
+        long = "exclude-session",
+        help = "Exclude a session id or session key; repeatable"
+    )]
+    pub exclude_sessions: Vec<String>,
 }
 
 pub fn run_recent(args: RecentArgs) -> Result<()> {
@@ -27,6 +38,10 @@ pub fn run_recent(args: RecentArgs) -> Result<()> {
         repo: args.repo,
         cwd: args.cwd,
         since: args.since,
+        from: args.from,
+        until: args.until,
+        include_duplicates: args.include_duplicates,
+        exclude_sessions: args.exclude_sessions,
     })?;
 
     if sessions.is_empty() {

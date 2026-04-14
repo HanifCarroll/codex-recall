@@ -58,6 +58,20 @@ fn write_session_file(
     .unwrap();
 }
 
+fn index_sources(db: &std::path::Path, sources: &[&std::path::Path]) {
+    let mut command = Command::new(env!("CARGO_BIN_EXE_codex-recall"));
+    command.args(["index", "--db"]).arg(db);
+    for source in sources {
+        command.args(["--source"]).arg(source);
+    }
+    let output = command.output().unwrap();
+    assert!(
+        output.status.success(),
+        "index failed: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+}
+
 fn write_many_sessions(root: &std::path::Path, count: usize) {
     let session_dir = root.join("2026/04/13");
     fs::create_dir_all(&session_dir).unwrap();
@@ -73,6 +87,25 @@ fn write_many_sessions(root: &std::path::Path, count: usize) {
         )
         .unwrap();
     }
+}
+
+#[test]
+fn search_does_not_create_missing_database() {
+    let temp = temp_dir("search-missing-db");
+    let db = temp.join("missing").join("index.sqlite");
+
+    let search = Command::new(env!("CARGO_BIN_EXE_codex-recall"))
+        .args(["search", "webhook", "--db"])
+        .arg(&db)
+        .output()
+        .unwrap();
+
+    assert!(!search.status.success());
+    assert!(!db.exists(), "search should not create the database");
+    assert!(
+        !db.parent().unwrap().exists(),
+        "search should not create the database directory"
+    );
 }
 
 #[test]
@@ -354,6 +387,148 @@ fn search_filters_by_repo_cwd_and_since_flags() {
     assert!(stdout.contains("new-palabruno"));
     assert!(!stdout.contains("old-palabruno"));
     assert!(!stdout.contains("genrupt"));
+}
+
+#[test]
+fn search_filters_by_from_until_and_excluded_session() {
+    let temp = temp_dir("search-range-exclude");
+    let source = temp.join("sessions");
+    let db = temp.join("index.sqlite");
+    write_session(
+        &source,
+        "too-old",
+        "/Users/me/projects/project",
+        "2026-04-01T01:00:00Z",
+    );
+    write_session(
+        &source,
+        "in-range",
+        "/Users/me/projects/project",
+        "2026-04-13T01:00:00Z",
+    );
+    write_session(
+        &source,
+        "excluded",
+        "/Users/me/projects/project",
+        "2026-04-13T02:00:00Z",
+    );
+    write_session(
+        &source,
+        "too-new",
+        "/Users/me/projects/project",
+        "2026-04-15T01:00:00Z",
+    );
+    index_sources(&db, &[&source]);
+
+    let search = Command::new(env!("CARGO_BIN_EXE_codex-recall"))
+        .args([
+            "search",
+            "webhook secret",
+            "--from",
+            "2026-04-10",
+            "--until",
+            "2026-04-14",
+            "--exclude-session",
+            "excluded",
+            "--db",
+        ])
+        .arg(&db)
+        .output()
+        .unwrap();
+    assert!(
+        search.status.success(),
+        "search failed: {}",
+        String::from_utf8_lossy(&search.stderr)
+    );
+
+    let stdout = String::from_utf8_lossy(&search.stdout);
+    assert!(stdout.contains("in-range"), "{stdout}");
+    assert!(!stdout.contains("too-old"), "{stdout}");
+    assert!(!stdout.contains("excluded"), "{stdout}");
+    assert!(!stdout.contains("too-new"), "{stdout}");
+}
+
+#[test]
+fn search_rejects_since_and_from_together() {
+    let temp = temp_dir("search-since-from");
+    let source = temp.join("sessions");
+    let db = temp.join("index.sqlite");
+    write_sample_session(&source);
+    index_sources(&db, &[&source]);
+
+    let search = Command::new(env!("CARGO_BIN_EXE_codex-recall"))
+        .args([
+            "search",
+            "webhook secret",
+            "--since",
+            "2026-04-01",
+            "--from",
+            "2026-04-01",
+            "--db",
+        ])
+        .arg(&db)
+        .output()
+        .unwrap();
+
+    assert!(!search.status.success());
+    assert!(String::from_utf8_lossy(&search.stderr).contains("use either --since or --from"));
+}
+
+#[test]
+fn search_dedupes_active_and_archived_session_copies_by_default() {
+    let temp = temp_dir("search-dedupe");
+    let active = temp.join("sessions");
+    let archived = temp.join("archived_sessions");
+    let db = temp.join("index.sqlite");
+    write_session_file(
+        &active,
+        "active.jsonl",
+        "session-dup",
+        "/Users/me/project",
+        "2026-04-13T01:00:00Z",
+        "The active webhook secret was missing.",
+    );
+    write_session_file(
+        &archived,
+        "archived.jsonl",
+        "session-dup",
+        "/Users/me/project",
+        "2026-04-13T01:00:00Z",
+        "The archived webhook secret was missing.",
+    );
+    index_sources(&db, &[&active, &archived]);
+
+    let search = Command::new(env!("CARGO_BIN_EXE_codex-recall"))
+        .args(["search", "webhook secret", "--json", "--db"])
+        .arg(&db)
+        .output()
+        .unwrap();
+    assert!(
+        search.status.success(),
+        "search failed: {}",
+        String::from_utf8_lossy(&search.stderr)
+    );
+    let json: serde_json::Value = serde_json::from_slice(&search.stdout).unwrap();
+    assert_eq!(json["count"], 1);
+    assert!(json["results"][0]["source_file_path"]
+        .as_str()
+        .unwrap()
+        .contains("/sessions/"));
+
+    let duplicate_search = Command::new(env!("CARGO_BIN_EXE_codex-recall"))
+        .args([
+            "search",
+            "webhook secret",
+            "--include-duplicates",
+            "--json",
+            "--db",
+        ])
+        .arg(&db)
+        .output()
+        .unwrap();
+    assert!(duplicate_search.status.success());
+    let json: serde_json::Value = serde_json::from_slice(&duplicate_search.stdout).unwrap();
+    assert_eq!(json["count"], 2);
 }
 
 #[test]
@@ -964,6 +1139,87 @@ fn recent_lists_latest_sessions_with_filters() {
     assert!(stdout.contains("codex-recall show"), "{stdout}");
     assert!(!stdout.contains("old-project"), "{stdout}");
     assert!(!stdout.contains("new-other"), "{stdout}");
+}
+
+#[test]
+fn recent_filters_by_from_until_exclusion_and_dedupes_duplicates() {
+    let temp = temp_dir("recent-range-dedupe");
+    let active = temp.join("sessions");
+    let archived = temp.join("archived_sessions");
+    let db = temp.join("index.sqlite");
+    write_session(
+        &active,
+        "too-old",
+        "/Users/me/projects/project",
+        "2026-04-01T01:00:00Z",
+    );
+    write_session_file(
+        &active,
+        "active.jsonl",
+        "session-dup",
+        "/Users/me/projects/project",
+        "2026-04-13T01:00:00Z",
+        "Active duplicate.",
+    );
+    write_session_file(
+        &archived,
+        "archived.jsonl",
+        "session-dup",
+        "/Users/me/projects/project",
+        "2026-04-13T01:00:00Z",
+        "Archived duplicate.",
+    );
+    write_session(
+        &active,
+        "excluded",
+        "/Users/me/projects/project",
+        "2026-04-13T02:00:00Z",
+    );
+    write_session(
+        &active,
+        "too-new",
+        "/Users/me/projects/project",
+        "2026-04-15T01:00:00Z",
+    );
+    index_sources(&db, &[&active, &archived]);
+
+    let recent = Command::new(env!("CARGO_BIN_EXE_codex-recall"))
+        .args([
+            "recent",
+            "--from",
+            "2026-04-10",
+            "--until",
+            "2026-04-14",
+            "--exclude-session",
+            "excluded",
+            "--db",
+        ])
+        .arg(&db)
+        .output()
+        .unwrap();
+    assert!(
+        recent.status.success(),
+        "recent failed: {}",
+        String::from_utf8_lossy(&recent.stderr)
+    );
+
+    let stdout = String::from_utf8_lossy(&recent.stdout);
+    assert!(stdout.contains("session-dup"), "{stdout}");
+    assert!(stdout.contains("/sessions/"), "{stdout}");
+    assert!(!stdout.contains("/archived_sessions/"), "{stdout}");
+    assert!(!stdout.contains("too-old"), "{stdout}");
+    assert!(!stdout.contains("excluded"), "{stdout}");
+    assert!(!stdout.contains("too-new"), "{stdout}");
+
+    let duplicate_recent = Command::new(env!("CARGO_BIN_EXE_codex-recall"))
+        .args(["recent", "--include-duplicates", "--db"])
+        .arg(&db)
+        .output()
+        .unwrap();
+    assert!(duplicate_recent.status.success());
+    let stdout = String::from_utf8_lossy(&duplicate_recent.stdout);
+    assert!(stdout.contains("/sessions/"), "{stdout}");
+    assert!(stdout.contains("/archived_sessions/"), "{stdout}");
 }
 
 #[test]

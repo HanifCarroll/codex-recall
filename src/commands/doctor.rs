@@ -179,7 +179,7 @@ fn default_launch_agent_path(label: &str) -> Result<PathBuf> {
 
 pub fn run_stats(args: StatsArgs) -> Result<()> {
     let db_path = args.db.unwrap_or(default_db_path()?);
-    let stats = Store::open(db_path)?.stats()?;
+    let stats = Store::open_readonly(db_path)?.stats()?;
     println!(
         "{} sessions, {} events, {} source files, {} duplicate source files",
         stats.session_count,

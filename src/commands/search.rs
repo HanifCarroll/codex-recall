@@ -22,6 +22,17 @@ pub struct SearchArgs {
     pub cwd: Option<String>,
     #[arg(long, help = "Restrict by age, for example 7d, today, or 2026-04-01")]
     pub since: Option<String>,
+    #[arg(long, help = "Restrict to sessions at or after this date/time")]
+    pub from: Option<String>,
+    #[arg(long, help = "Restrict to sessions before this date/time")]
+    pub until: Option<String>,
+    #[arg(long, help = "Include duplicate active/archive copies")]
+    pub include_duplicates: bool,
+    #[arg(
+        long = "exclude-session",
+        help = "Exclude a session id or session key; repeatable"
+    )]
+    pub exclude_sessions: Vec<String>,
     #[arg(long, help = "Emit machine-readable JSON")]
     pub json: bool,
 }
@@ -42,6 +53,17 @@ pub struct BundleArgs {
     pub cwd: Option<String>,
     #[arg(long, help = "Restrict by age, for example 7d, today, or 2026-04-01")]
     pub since: Option<String>,
+    #[arg(long, help = "Restrict to sessions at or after this date/time")]
+    pub from: Option<String>,
+    #[arg(long, help = "Restrict to sessions before this date/time")]
+    pub until: Option<String>,
+    #[arg(long, help = "Include duplicate active/archive copies")]
+    pub include_duplicates: bool,
+    #[arg(
+        long = "exclude-session",
+        help = "Exclude a session id or session key; repeatable"
+    )]
+    pub exclude_sessions: Vec<String>,
 }
 
 #[derive(Debug, Clone, Args)]
@@ -56,7 +78,7 @@ pub struct ShowArgs {
 
 pub fn run_search(args: SearchArgs) -> Result<()> {
     let db_path = args.db.unwrap_or(default_db_path()?);
-    let store = Store::open(&db_path)?;
+    let store = Store::open_readonly(&db_path)?;
     let current_repo = if args.repo.is_none() && !args.all_repos {
         detect_current_repo()
     } else {
@@ -73,6 +95,10 @@ pub fn run_search(args: SearchArgs) -> Result<()> {
         repo: args.repo,
         cwd: args.cwd,
         since: args.since,
+        from: args.from,
+        until: args.until,
+        include_duplicates: args.include_duplicates,
+        exclude_sessions: args.exclude_sessions,
         current_repo,
     })?;
     if args.json {
@@ -91,7 +117,7 @@ pub fn run_search(args: SearchArgs) -> Result<()> {
 
 pub fn run_bundle(args: BundleArgs) -> Result<()> {
     let db_path = args.db.unwrap_or(default_db_path()?);
-    let store = Store::open(&db_path)?;
+    let store = Store::open_readonly(&db_path)?;
     let current_repo = if args.repo.is_none() && !args.all_repos {
         detect_current_repo()
     } else {
@@ -103,24 +129,29 @@ pub fn run_bundle(args: BundleArgs) -> Result<()> {
         repo: args.repo.clone(),
         cwd: args.cwd.clone(),
         since: args.since.clone(),
+        from: args.from.clone(),
+        until: args.until.clone(),
+        include_duplicates: args.include_duplicates,
+        exclude_sessions: args.exclude_sessions.clone(),
         current_repo,
     })?;
 
-    print_bundle(
-        &args.query,
-        &db_path,
-        args.limit,
-        &args.repo,
-        &args.cwd,
-        &args.since,
-        &results,
-    );
+    let filters = BundleFilters {
+        repo: &args.repo,
+        cwd: &args.cwd,
+        since: &args.since,
+        from: &args.from,
+        until: &args.until,
+        include_duplicates: args.include_duplicates,
+        exclude_sessions: &args.exclude_sessions,
+    };
+    print_bundle(&args.query, &db_path, args.limit, filters, &results);
     Ok(())
 }
 
 pub fn run_show(args: ShowArgs) -> Result<()> {
     let db_path = args.db.unwrap_or(default_db_path()?);
-    let store = Store::open(&db_path)?;
+    let store = Store::open_readonly(&db_path)?;
     let matches = store.resolve_session_reference(&args.session_ref)?;
     if matches.is_empty() {
         println!("no indexed events for {}", args.session_ref);
@@ -206,22 +237,30 @@ fn print_grouped_search_results(results: &[SearchResult], limit: usize) {
     }
 }
 
+struct BundleFilters<'a> {
+    repo: &'a Option<String>,
+    cwd: &'a Option<String>,
+    since: &'a Option<String>,
+    from: &'a Option<String>,
+    until: &'a Option<String>,
+    include_duplicates: bool,
+    exclude_sessions: &'a [String],
+}
+
 fn print_bundle(
     query: &str,
     db_path: &Path,
     limit: usize,
-    repo: &Option<String>,
-    cwd: &Option<String>,
-    since: &Option<String>,
+    filters: BundleFilters<'_>,
     results: &[SearchResult],
 ) {
     println!("# codex-recall bundle");
     println!();
     println!("Query: {query}");
     println!("Database: {}", db_path.display());
-    let filters = bundle_filters(repo, cwd, since);
-    if !filters.is_empty() {
-        println!("Filters: {}", filters.join(", "));
+    let filter_labels = bundle_filters(filters);
+    if !filter_labels.is_empty() {
+        println!("Filters: {}", filter_labels.join(", "));
     }
     println!("Generated: {}", now_timestamp());
 
@@ -285,22 +324,30 @@ fn print_bundle(
     }
 }
 
-fn bundle_filters(
-    repo: &Option<String>,
-    cwd: &Option<String>,
-    since: &Option<String>,
-) -> Vec<String> {
-    let mut filters = Vec::new();
-    if let Some(repo) = repo {
-        filters.push(format!("repo={repo}"));
+fn bundle_filters(filters: BundleFilters<'_>) -> Vec<String> {
+    let mut labels = Vec::new();
+    if let Some(repo) = filters.repo {
+        labels.push(format!("repo={repo}"));
     }
-    if let Some(cwd) = cwd {
-        filters.push(format!("cwd={cwd}"));
+    if let Some(cwd) = filters.cwd {
+        labels.push(format!("cwd={cwd}"));
     }
-    if let Some(since) = since {
-        filters.push(format!("since={since}"));
+    if let Some(since) = filters.since {
+        labels.push(format!("since={since}"));
     }
-    filters
+    if let Some(from) = filters.from {
+        labels.push(format!("from={from}"));
+    }
+    if let Some(until) = filters.until {
+        labels.push(format!("until={until}"));
+    }
+    if filters.include_duplicates {
+        labels.push("include-duplicates=true".to_owned());
+    }
+    for excluded_session in filters.exclude_sessions {
+        labels.push(format!("exclude-session={excluded_session}"));
+    }
+    labels
 }
 
 fn top_session_keys(results: &[SearchResult], limit: usize) -> Vec<&str> {
