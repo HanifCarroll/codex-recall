@@ -1,3 +1,6 @@
+use crate::commands::date::resolve_date_window;
+use crate::commands::exclude::resolve_excluded_sessions;
+use crate::commands::kind::{event_kinds, KindArg};
 use crate::config::default_db_path;
 use crate::output::{compact_whitespace, now_timestamp, preview, shell_quote};
 use crate::store::{SearchOptions, SearchResult, Store};
@@ -26,6 +29,15 @@ pub struct SearchArgs {
     pub from: Option<String>,
     #[arg(long, help = "Restrict to sessions before this date/time")]
     pub until: Option<String>,
+    #[arg(long, help = "Restrict to one local calendar day, YYYY-MM-DD")]
+    pub day: Option<String>,
+    #[arg(
+        long = "kind",
+        value_enum,
+        value_name = "KIND",
+        help = "Restrict matches by event kind; repeatable"
+    )]
+    pub kinds: Vec<KindArg>,
     #[arg(long, help = "Include duplicate active/archive copies")]
     pub include_duplicates: bool,
     #[arg(
@@ -33,6 +45,8 @@ pub struct SearchArgs {
         help = "Exclude a session id or session key; repeatable"
     )]
     pub exclude_sessions: Vec<String>,
+    #[arg(long, help = "Exclude the current Codex session from results")]
+    pub exclude_current: bool,
     #[arg(long, help = "Emit machine-readable JSON")]
     pub json: bool,
 }
@@ -57,6 +71,15 @@ pub struct BundleArgs {
     pub from: Option<String>,
     #[arg(long, help = "Restrict to sessions before this date/time")]
     pub until: Option<String>,
+    #[arg(long, help = "Restrict to one local calendar day, YYYY-MM-DD")]
+    pub day: Option<String>,
+    #[arg(
+        long = "kind",
+        value_enum,
+        value_name = "KIND",
+        help = "Restrict matches by event kind; repeatable"
+    )]
+    pub kinds: Vec<KindArg>,
     #[arg(long, help = "Include duplicate active/archive copies")]
     pub include_duplicates: bool,
     #[arg(
@@ -64,6 +87,8 @@ pub struct BundleArgs {
         help = "Exclude a session id or session key; repeatable"
     )]
     pub exclude_sessions: Vec<String>,
+    #[arg(long, help = "Exclude the current Codex session from results")]
+    pub exclude_current: bool,
 }
 
 #[derive(Debug, Clone, Args)]
@@ -74,11 +99,23 @@ pub struct ShowArgs {
     pub db: Option<PathBuf>,
     #[arg(long, default_value_t = 80, help = "Maximum events to print")]
     pub limit: usize,
+    #[arg(
+        long = "kind",
+        value_enum,
+        value_name = "KIND",
+        help = "Restrict events by kind; repeatable"
+    )]
+    pub kinds: Vec<KindArg>,
+    #[arg(long, help = "Emit machine-readable JSON")]
+    pub json: bool,
 }
 
 pub fn run_search(args: SearchArgs) -> Result<()> {
     let db_path = args.db.unwrap_or(default_db_path()?);
     let store = Store::open_readonly(&db_path)?;
+    let (since, from, until) = resolve_date_window(args.since, args.from, args.until, args.day)?;
+    let exclude_sessions = resolve_excluded_sessions(args.exclude_sessions, args.exclude_current)?;
+    let kinds = event_kinds(&args.kinds);
     let current_repo = if args.repo.is_none() && !args.all_repos {
         detect_current_repo()
     } else {
@@ -94,11 +131,12 @@ pub fn run_search(args: SearchArgs) -> Result<()> {
         limit: search_limit,
         repo: args.repo,
         cwd: args.cwd,
-        since: args.since,
-        from: args.from,
-        until: args.until,
+        since,
+        from,
+        until,
         include_duplicates: args.include_duplicates,
-        exclude_sessions: args.exclude_sessions,
+        exclude_sessions,
+        kinds,
         current_repo,
     })?;
     if args.json {
@@ -118,6 +156,9 @@ pub fn run_search(args: SearchArgs) -> Result<()> {
 pub fn run_bundle(args: BundleArgs) -> Result<()> {
     let db_path = args.db.unwrap_or(default_db_path()?);
     let store = Store::open_readonly(&db_path)?;
+    let (since, from, until) = resolve_date_window(args.since, args.from, args.until, args.day)?;
+    let exclude_sessions = resolve_excluded_sessions(args.exclude_sessions, args.exclude_current)?;
+    let kinds = event_kinds(&args.kinds);
     let current_repo = if args.repo.is_none() && !args.all_repos {
         detect_current_repo()
     } else {
@@ -128,22 +169,24 @@ pub fn run_bundle(args: BundleArgs) -> Result<()> {
         limit: args.limit.saturating_mul(5).max(args.limit),
         repo: args.repo.clone(),
         cwd: args.cwd.clone(),
-        since: args.since.clone(),
-        from: args.from.clone(),
-        until: args.until.clone(),
+        since: since.clone(),
+        from: from.clone(),
+        until: until.clone(),
         include_duplicates: args.include_duplicates,
-        exclude_sessions: args.exclude_sessions.clone(),
+        exclude_sessions: exclude_sessions.clone(),
+        kinds: kinds.clone(),
         current_repo,
     })?;
 
     let filters = BundleFilters {
         repo: &args.repo,
         cwd: &args.cwd,
-        since: &args.since,
-        from: &args.from,
-        until: &args.until,
+        since: &since,
+        from: &from,
+        until: &until,
+        kinds: &args.kinds,
         include_duplicates: args.include_duplicates,
-        exclude_sessions: &args.exclude_sessions,
+        exclude_sessions: &exclude_sessions,
     };
     print_bundle(&args.query, &db_path, args.limit, filters, &results);
     Ok(())
@@ -177,9 +220,14 @@ pub fn run_show(args: ShowArgs) -> Result<()> {
     }
 
     let session = &matches[0];
-    let events = store.session_events(&session.session_key, args.limit)?;
+    let kinds = event_kinds(&args.kinds);
+    let events = store.session_events_with_kinds(&session.session_key, args.limit, &kinds)?;
     if events.is_empty() {
         println!("no indexed events for {}", args.session_ref);
+        return Ok(());
+    }
+    if args.json {
+        print_show_json(session, &events)?;
         return Ok(());
     }
 
@@ -243,6 +291,7 @@ struct BundleFilters<'a> {
     since: &'a Option<String>,
     from: &'a Option<String>,
     until: &'a Option<String>,
+    kinds: &'a [KindArg],
     include_duplicates: bool,
     exclude_sessions: &'a [String],
 }
@@ -341,6 +390,9 @@ fn bundle_filters(filters: BundleFilters<'_>) -> Vec<String> {
     if let Some(until) = filters.until {
         labels.push(format!("until={until}"));
     }
+    for kind in filters.kinds {
+        labels.push(format!("kind={}", kind.as_str()));
+    }
     if filters.include_duplicates {
         labels.push("include-duplicates=true".to_owned());
     }
@@ -364,6 +416,43 @@ fn top_session_keys(results: &[SearchResult], limit: usize) -> Vec<&str> {
         }
     }
     session_keys
+}
+
+fn print_show_json(
+    session: &crate::store::SessionMatch,
+    events: &[crate::store::SessionEvent],
+) -> Result<()> {
+    let events = events
+        .iter()
+        .map(|event| {
+            let source = format!(
+                "{}:{}",
+                event.source_file_path.display(),
+                event.source_line_number
+            );
+            json!({
+                "kind": event.kind.as_str(),
+                "text": event.text,
+                "cwd": event.cwd,
+                "source_file_path": event.source_file_path,
+                "source_line_number": event.source_line_number,
+                "source": source,
+                "source_timestamp": event.source_timestamp,
+            })
+        })
+        .collect::<Vec<_>>();
+
+    let value = json!({
+        "session_key": session.session_key,
+        "session_id": session.session_id,
+        "repo": session.repo,
+        "cwd": session.cwd,
+        "source_file_path": session.source_file_path,
+        "count": events.len(),
+        "events": events,
+    });
+    println!("{}", serde_json::to_string_pretty(&value)?);
+    Ok(())
 }
 
 fn print_search_json(query: &str, results: &[SearchResult]) -> Result<()> {

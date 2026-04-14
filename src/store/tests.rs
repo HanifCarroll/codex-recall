@@ -127,6 +127,7 @@ fn keeps_duplicate_session_ids_by_source_file() {
             until: None,
             include_duplicates: true,
             exclude_sessions: Vec::new(),
+            kinds: Vec::new(),
             current_repo: None,
         })
         .unwrap();
@@ -174,6 +175,7 @@ fn ranks_current_repo_sessions_before_other_repos() {
             until: None,
             include_duplicates: false,
             exclude_sessions: Vec::new(),
+            kinds: Vec::new(),
             current_repo: Some("project".to_owned()),
         })
         .unwrap();
@@ -225,6 +227,7 @@ fn ranks_current_repo_when_only_a_command_ran_inside_that_repo() {
             until: None,
             include_duplicates: false,
             exclude_sessions: Vec::new(),
+            kinds: Vec::new(),
             current_repo: Some("project".to_owned()),
         })
         .unwrap();
@@ -272,6 +275,7 @@ fn filters_search_by_repo_cwd_and_since() {
             until: None,
             include_duplicates: false,
             exclude_sessions: Vec::new(),
+            kinds: Vec::new(),
             current_repo: None,
         })
         .unwrap();

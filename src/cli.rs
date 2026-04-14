@@ -1,7 +1,7 @@
 use crate::commands::doctor::{run_doctor, run_stats, DoctorArgs, StatsArgs};
 use crate::commands::index::{run_index, run_rebuild, IndexArgs, RebuildArgs};
 use crate::commands::pins::{run_pin, run_pins, run_unpin, PinArgs, PinsArgs, UnpinArgs};
-use crate::commands::recent::{run_recent, RecentArgs};
+use crate::commands::recent::{run_day, run_recent, DayArgs, RecentArgs};
 use crate::commands::search::{run_bundle, run_search, run_show, BundleArgs, SearchArgs, ShowArgs};
 use crate::commands::watch::{run_status, run_watch, StatusArgs, WatchArgs};
 use anyhow::Result;
@@ -31,6 +31,8 @@ enum Command {
     Search(SearchArgs),
     /// Show latest indexed sessions without a query.
     Recent(RecentArgs),
+    /// Show an indexed session inventory for one local calendar day.
+    Day(DayArgs),
     /// Print a compact Markdown bundle for a search query.
     Bundle(BundleArgs),
     /// Show indexed events for one session.
@@ -56,6 +58,7 @@ pub fn run(args: impl IntoIterator<Item = String>) -> Result<()> {
         Some(Command::Status(args)) => run_status(args),
         Some(Command::Search(args)) => run_search(args),
         Some(Command::Recent(args)) => run_recent(args),
+        Some(Command::Day(args)) => run_day(args),
         Some(Command::Bundle(args)) => run_bundle(args),
         Some(Command::Show(args)) => run_show(args),
         Some(Command::Pin(args)) => run_pin(args),

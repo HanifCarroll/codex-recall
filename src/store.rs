@@ -47,6 +47,7 @@ pub struct SearchOptions {
     pub until: Option<String>,
     pub include_duplicates: bool,
     pub exclude_sessions: Vec<String>,
+    pub kinds: Vec<EventKind>,
     pub current_repo: Option<String>,
 }
 
@@ -62,6 +63,7 @@ impl SearchOptions {
             until: None,
             include_duplicates: false,
             exclude_sessions: Vec::new(),
+            kinds: Vec::new(),
             current_repo: None,
         }
     }
@@ -108,6 +110,7 @@ pub struct RecentOptions {
     pub until: Option<String>,
     pub include_duplicates: bool,
     pub exclude_sessions: Vec<String>,
+    pub kinds: Vec<EventKind>,
 }
 
 impl Default for RecentOptions {
@@ -121,6 +124,7 @@ impl Default for RecentOptions {
             until: None,
             include_duplicates: false,
             exclude_sessions: Vec::new(),
+            kinds: Vec::new(),
         }
     }
 }
@@ -347,6 +351,7 @@ impl Store {
             options.until.as_ref(),
         )?;
         append_excluded_sessions_clause(&mut sql, &mut query_params, &options.exclude_sessions);
+        append_event_kind_clause(&mut sql, &mut query_params, "events.kind", &options.kinds);
 
         sql.push_str(" ORDER BY events_fts.rank ASC, events.source_line_number ASC LIMIT ");
         sql.push_str(&limit.to_string());
@@ -467,6 +472,7 @@ impl Store {
             options.until.as_ref(),
         )?;
         append_excluded_sessions_clause(&mut sql, &mut query_params, &options.exclude_sessions);
+        append_recent_event_kind_clause(&mut sql, &mut query_params, &options.kinds);
 
         sql.push_str(
             r#"
@@ -499,9 +505,18 @@ impl Store {
     }
 
     pub fn session_events(&self, session_key: &str, limit: usize) -> Result<Vec<SessionEvent>> {
+        self.session_events_with_kinds(session_key, limit, &[])
+    }
+
+    pub fn session_events_with_kinds(
+        &self,
+        session_key: &str,
+        limit: usize,
+        kinds: &[EventKind],
+    ) -> Result<Vec<SessionEvent>> {
         let limit = limit.clamp(1, 500);
-        let mut statement = self.conn.prepare(
-            r#"
+        let mut query_params = vec![session_key.to_owned()];
+        let mut sql = r#"
             SELECT
                 events.session_key,
                 events.session_id,
@@ -514,12 +529,20 @@ impl Store {
             FROM events
             JOIN sessions ON sessions.session_key = events.session_key
             WHERE events.session_key = ?
+            "#
+        .to_owned();
+        append_event_kind_clause(&mut sql, &mut query_params, "events.kind", kinds);
+        sql.push_str(
+            r#"
             ORDER BY events.source_line_number ASC
             LIMIT ?
             "#,
-        )?;
+        );
+        query_params.push(limit.to_string());
 
-        let rows = statement.query_map(params![session_key, limit as i64], |row| {
+        let mut statement = self.conn.prepare(&sql)?;
+
+        let rows = statement.query_map(params_from_iter(query_params.iter()), |row| {
             let kind_text: String = row.get(2)?;
             let kind = kind_text.parse::<EventKind>().map_err(|_| {
                 rusqlite::Error::InvalidColumnType(
@@ -1254,6 +1277,54 @@ fn append_excluded_sessions_clause(
         query_params.push(excluded_session.clone());
         query_params.push(excluded_session.clone());
     }
+}
+
+fn append_event_kind_clause(
+    sql: &mut String,
+    query_params: &mut Vec<String>,
+    column_name: &str,
+    kinds: &[EventKind],
+) {
+    if kinds.is_empty() {
+        return;
+    }
+    sql.push_str(" AND ");
+    sql.push_str(column_name);
+    sql.push_str(" IN (");
+    sql.push_str(&placeholders(kinds.len()));
+    sql.push(')');
+    append_kind_params(query_params, kinds);
+}
+
+fn append_recent_event_kind_clause(
+    sql: &mut String,
+    query_params: &mut Vec<String>,
+    kinds: &[EventKind],
+) {
+    if kinds.is_empty() {
+        return;
+    }
+    sql.push_str(
+        r#"
+        AND EXISTS (
+            SELECT 1 FROM events kind_events
+            WHERE kind_events.session_key = sessions.session_key
+              AND kind_events.kind IN (
+        "#,
+    );
+    sql.push_str(&placeholders(kinds.len()));
+    sql.push_str("))");
+    append_kind_params(query_params, kinds);
+}
+
+fn placeholders(count: usize) -> String {
+    std::iter::repeat_n("?", count)
+        .collect::<Vec<_>>()
+        .join(", ")
+}
+
+fn append_kind_params(query_params: &mut Vec<String>, kinds: &[EventKind]) {
+    query_params.extend(kinds.iter().map(|kind| kind.as_str().to_owned()));
 }
 
 struct SessionGroup {

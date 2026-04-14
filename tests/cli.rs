@@ -58,6 +58,28 @@ fn write_session_file(
     .unwrap();
 }
 
+fn write_mixed_session_file(
+    root: &std::path::Path,
+    file_name: &str,
+    id: &str,
+    cwd: &str,
+    timestamp: &str,
+) {
+    let session_dir = root.join("2026/04/13");
+    fs::create_dir_all(&session_dir).unwrap();
+    fs::write(
+        session_dir.join(file_name),
+        format!(
+            r#"{{"timestamp":"{timestamp}","type":"session_meta","payload":{{"id":"{id}","timestamp":"{timestamp}","cwd":"{cwd}","cli_version":"0.1.0"}}}}
+{{"timestamp":"{timestamp}","type":"event_msg","payload":{{"type":"user_message","message":"Find the webhook secret bug"}}}}
+{{"timestamp":"{timestamp}","type":"event_msg","payload":{{"type":"agent_message","message":"The webhook secret was missing in production."}}}}
+{{"timestamp":"{timestamp}","type":"event_msg","payload":{{"type":"exec_command_end","command":["/bin/zsh","-lc","rg webhook"],"cwd":"{cwd}","exit_code":0,"aggregated_output":"webhook command receipt"}}}}
+"#
+        ),
+    )
+    .unwrap();
+}
+
 fn index_sources(db: &std::path::Path, sources: &[&std::path::Path]) {
     let mut command = Command::new(env!("CARGO_BIN_EXE_codex-recall"));
     command.args(["index", "--db"]).arg(db);
@@ -529,6 +551,88 @@ fn search_dedupes_active_and_archived_session_copies_by_default() {
     assert!(duplicate_search.status.success());
     let json: serde_json::Value = serde_json::from_slice(&duplicate_search.stdout).unwrap();
     assert_eq!(json["count"], 2);
+}
+
+#[test]
+fn search_supports_day_kind_json_and_exclude_current() {
+    let temp = temp_dir("search-day-kind-current");
+    let source = temp.join("sessions");
+    let db = temp.join("index.sqlite");
+    write_mixed_session_file(
+        &source,
+        "current.jsonl",
+        "current-session",
+        "/Users/me/project",
+        "2026-04-13T01:00:00Z",
+    );
+    write_mixed_session_file(
+        &source,
+        "kept.jsonl",
+        "kept-session",
+        "/Users/me/project",
+        "2026-04-13T02:00:00Z",
+    );
+    write_mixed_session_file(
+        &source,
+        "other-day.jsonl",
+        "other-day",
+        "/Users/me/project",
+        "2026-04-14T01:00:00Z",
+    );
+    index_sources(&db, &[&source]);
+
+    let search = Command::new(env!("CARGO_BIN_EXE_codex-recall"))
+        .env("CODEX_THREAD_ID", "current-session")
+        .args([
+            "search",
+            "webhook",
+            "--day",
+            "2026-04-13",
+            "--kind",
+            "assistant",
+            "--exclude-current",
+            "--json",
+            "--db",
+        ])
+        .arg(&db)
+        .output()
+        .unwrap();
+    assert!(
+        search.status.success(),
+        "search failed: {}",
+        String::from_utf8_lossy(&search.stderr)
+    );
+
+    let json: serde_json::Value = serde_json::from_slice(&search.stdout).unwrap();
+    assert_eq!(json["count"], 1);
+    assert_eq!(json["results"][0]["session_id"], "kept-session");
+    assert_eq!(json["results"][0]["kind"], "assistant_message");
+}
+
+#[test]
+fn search_rejects_day_with_other_date_filters() {
+    let temp = temp_dir("search-day-conflict");
+    let source = temp.join("sessions");
+    let db = temp.join("index.sqlite");
+    write_sample_session(&source);
+    index_sources(&db, &[&source]);
+
+    let search = Command::new(env!("CARGO_BIN_EXE_codex-recall"))
+        .args([
+            "search",
+            "webhook",
+            "--day",
+            "2026-04-13",
+            "--since",
+            "7d",
+            "--db",
+        ])
+        .arg(&db)
+        .output()
+        .unwrap();
+
+    assert!(!search.status.success());
+    assert!(String::from_utf8_lossy(&search.stderr).contains("use --day by itself"));
 }
 
 #[test]
@@ -1220,6 +1324,126 @@ fn recent_filters_by_from_until_exclusion_and_dedupes_duplicates() {
     let stdout = String::from_utf8_lossy(&duplicate_recent.stdout);
     assert!(stdout.contains("/sessions/"), "{stdout}");
     assert!(stdout.contains("/archived_sessions/"), "{stdout}");
+}
+
+#[test]
+fn recent_json_supports_day_and_kind_filter() {
+    let temp = temp_dir("recent-json-day-kind");
+    let source = temp.join("sessions");
+    let db = temp.join("index.sqlite");
+    write_mixed_session_file(
+        &source,
+        "with-command.jsonl",
+        "with-command",
+        "/Users/me/projects/project",
+        "2026-04-13T01:00:00Z",
+    );
+    write_session(
+        &source,
+        "other-day",
+        "/Users/me/projects/project",
+        "2026-04-14T01:00:00Z",
+    );
+    index_sources(&db, &[&source]);
+
+    let recent = Command::new(env!("CARGO_BIN_EXE_codex-recall"))
+        .args([
+            "recent",
+            "--day",
+            "2026-04-13",
+            "--kind",
+            "command",
+            "--json",
+            "--db",
+        ])
+        .arg(&db)
+        .output()
+        .unwrap();
+    assert!(
+        recent.status.success(),
+        "recent failed: {}",
+        String::from_utf8_lossy(&recent.stderr)
+    );
+
+    let json: serde_json::Value = serde_json::from_slice(&recent.stdout).unwrap();
+    assert_eq!(json["count"], 1);
+    assert_eq!(json["sessions"][0]["session_id"], "with-command");
+}
+
+#[test]
+fn show_json_supports_kind_filter() {
+    let temp = temp_dir("show-json-kind");
+    let source = temp.join("sessions");
+    let db = temp.join("index.sqlite");
+    write_mixed_session_file(
+        &source,
+        "mixed.jsonl",
+        "mixed-session",
+        "/Users/me/projects/project",
+        "2026-04-13T01:00:00Z",
+    );
+    index_sources(&db, &[&source]);
+
+    let show = Command::new(env!("CARGO_BIN_EXE_codex-recall"))
+        .args(["show", "mixed-session", "--kind", "user", "--json", "--db"])
+        .arg(&db)
+        .output()
+        .unwrap();
+    assert!(
+        show.status.success(),
+        "show failed: {}",
+        String::from_utf8_lossy(&show.stderr)
+    );
+
+    let json: serde_json::Value = serde_json::from_slice(&show.stdout).unwrap();
+    assert_eq!(json["session_id"], "mixed-session");
+    assert_eq!(json["events"].as_array().unwrap().len(), 1);
+    assert_eq!(json["events"][0]["kind"], "user_message");
+}
+
+#[test]
+fn day_json_outputs_session_inventory() {
+    let temp = temp_dir("day-json");
+    let source = temp.join("sessions");
+    let db = temp.join("index.sqlite");
+    write_session(
+        &source,
+        "project-one",
+        "/Users/me/projects/project",
+        "2026-04-13T01:00:00Z",
+    );
+    write_session(
+        &source,
+        "other-one",
+        "/Users/me/projects/other",
+        "2026-04-13T02:00:00Z",
+    );
+    write_session(
+        &source,
+        "next-day",
+        "/Users/me/projects/project",
+        "2026-04-14T01:00:00Z",
+    );
+    index_sources(&db, &[&source]);
+
+    let day = Command::new(env!("CARGO_BIN_EXE_codex-recall"))
+        .args(["day", "2026-04-13", "--json", "--db"])
+        .arg(&db)
+        .output()
+        .unwrap();
+    assert!(
+        day.status.success(),
+        "day failed: {}",
+        String::from_utf8_lossy(&day.stderr)
+    );
+
+    let json: serde_json::Value = serde_json::from_slice(&day.stdout).unwrap();
+    assert_eq!(json["day"], "2026-04-13");
+    assert_eq!(json["from"], "2026-04-13");
+    assert_eq!(json["until"], "2026-04-14");
+    assert_eq!(json["count"], 2);
+    assert_eq!(json["repo_counts"]["project"], 1);
+    assert_eq!(json["repo_counts"]["other"], 1);
 }
 
 #[test]
