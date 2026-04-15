@@ -1070,6 +1070,16 @@ fn watch_installs_launch_agent_plist_when_requested() {
         .args(["--interval", "60", "--quiet-for", "5"])
         .output()
         .unwrap();
+    if !cfg!(target_os = "macos") {
+        assert!(!install.status.success());
+        assert!(
+            String::from_utf8_lossy(&install.stderr)
+                .contains("watch --install-launch-agent is only supported on macOS"),
+            "{}",
+            String::from_utf8_lossy(&install.stderr)
+        );
+        return;
+    }
     assert!(
         install.status.success(),
         "install failed: {}",
@@ -1132,6 +1142,16 @@ fn watch_can_install_and_start_launch_agent_with_configurable_launchctl() {
         .args(["--interval", "60", "--quiet-for", "5"])
         .output()
         .unwrap();
+    if !cfg!(target_os = "macos") {
+        assert!(!install.status.success());
+        assert!(
+            String::from_utf8_lossy(&install.stderr)
+                .contains("watch --install-launch-agent is only supported on macOS"),
+            "{}",
+            String::from_utf8_lossy(&install.stderr)
+        );
+        return;
+    }
     assert!(
         install.status.success(),
         "install failed: {}",

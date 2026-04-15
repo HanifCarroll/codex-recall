@@ -6,6 +6,12 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ## [Unreleased]
 
+## [0.1.1] - 2026-04-15
+
+### Fixed
+
+- Made the LaunchAgent CLI tests platform-aware so GitHub Actions passes on Linux runners while still exercising the full install path on macOS.
+
 ## [0.1.0] - 2026-04-15
 
 ### Added
