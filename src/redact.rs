@@ -160,10 +160,7 @@ mod tests {
         let openai_key = joined(&["sk", "-proj-", "1234567890abcdefghijklmnop"]);
         let stripe_webhook_secret = joined(&["whsec", "_", "1234567890abcdefghijklmnop"]);
         let fixtures = [
-            (
-                format!("OPENAI_API_KEY = \"{openai_key}\""),
-                openai_key,
-            ),
+            (format!("OPENAI_API_KEY = \"{openai_key}\""), openai_key),
             (
                 format!("STRIPE_WEBHOOK_SECRET='{stripe_webhook_secret}'"),
                 stripe_webhook_secret,
