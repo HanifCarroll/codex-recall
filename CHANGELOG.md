@@ -11,6 +11,7 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 ### Fixed
 
 - Made the LaunchAgent CLI tests platform-aware so GitHub Actions passes on Linux runners while still exercising the full install path on macOS.
+- Bumped `actions/checkout` to a Node 24 compatible major in the CI workflow to avoid the GitHub-hosted runner deprecation warning.
 
 ## [0.1.0] - 2026-04-15
 
