@@ -1,6 +1,7 @@
 /target
 /.codex-recall
 /.hermes
+.DS_Store
 *.sqlite
 *.sqlite-shm
 *.sqlite-wal

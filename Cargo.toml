@@ -4,6 +4,11 @@ version = "0.1.0"
 edition = "2021"
 description = "Local search and recall for Codex session JSONL archives"
 license = "MIT"
+readme = "README.md"
+repository = "https://github.com/HanifCarroll/codex-recall"
+homepage = "https://github.com/HanifCarroll/codex-recall"
+keywords = ["codex", "search", "jsonl", "sqlite", "cli"]
+categories = ["command-line-utilities", "development-tools"]
 
 [dependencies]
 anyhow = "1.0"

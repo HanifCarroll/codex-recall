@@ -204,6 +204,47 @@ fn subcommand_help_lists_typed_flags() {
 }
 
 #[test]
+fn help_uses_generic_launch_agent_defaults() {
+    let watch = Command::new(env!("CARGO_BIN_EXE_codex-recall"))
+        .args(["watch", "--help"])
+        .output()
+        .unwrap();
+    assert!(
+        watch.status.success(),
+        "watch help failed: {}",
+        String::from_utf8_lossy(&watch.stderr)
+    );
+    let watch_stdout = String::from_utf8_lossy(&watch.stdout);
+    assert!(
+        watch_stdout.contains("[default: dev.codex-recall.watch]"),
+        "{watch_stdout}"
+    );
+    assert!(
+        !watch_stdout.contains("com.hanif.codex-recall.watch"),
+        "{watch_stdout}"
+    );
+
+    let doctor = Command::new(env!("CARGO_BIN_EXE_codex-recall"))
+        .args(["doctor", "--help"])
+        .output()
+        .unwrap();
+    assert!(
+        doctor.status.success(),
+        "doctor help failed: {}",
+        String::from_utf8_lossy(&doctor.stderr)
+    );
+    let doctor_stdout = String::from_utf8_lossy(&doctor.stdout);
+    assert!(
+        doctor_stdout.contains("[default: dev.codex-recall.watch]"),
+        "{doctor_stdout}"
+    );
+    assert!(
+        !doctor_stdout.contains("com.hanif.codex-recall.watch"),
+        "{doctor_stdout}"
+    );
+}
+
+#[test]
 fn search_json_outputs_machine_readable_receipts() {
     let temp = temp_dir("search-json");
     let source = temp.join("sessions");
@@ -358,20 +399,20 @@ fn search_filters_by_repo_cwd_and_since_flags() {
     let db = temp.join("index.sqlite");
     write_session(
         &source,
-        "old-palabruno",
-        "/Users/me/projects/palabruno",
+        "old-acme-api",
+        "/Users/me/projects/acme-api",
         "2026-04-01T01:00:00Z",
     );
     write_session(
         &source,
-        "new-palabruno",
-        "/Users/me/projects/palabruno",
+        "new-acme-api",
+        "/Users/me/projects/acme-api",
         "2026-04-13T01:00:00Z",
     );
     write_session(
         &source,
-        "genrupt",
-        "/Users/me/projects/Genrupt",
+        "ops-tool",
+        "/Users/me/projects/ops-tool",
         "2026-04-13T01:00:00Z",
     );
 
@@ -389,9 +430,9 @@ fn search_filters_by_repo_cwd_and_since_flags() {
             "search",
             "webhook secret",
             "--repo",
-            "palabruno",
+            "acme-api",
             "--cwd",
-            "projects/palabruno",
+            "projects/acme-api",
             "--since",
             "2026-04-10",
             "--db",
@@ -406,9 +447,9 @@ fn search_filters_by_repo_cwd_and_since_flags() {
     );
 
     let stdout = String::from_utf8_lossy(&search.stdout);
-    assert!(stdout.contains("new-palabruno"));
-    assert!(!stdout.contains("old-palabruno"));
-    assert!(!stdout.contains("genrupt"));
+    assert!(stdout.contains("new-acme-api"));
+    assert!(!stdout.contains("old-acme-api"));
+    assert!(!stdout.contains("ops-tool"));
 }
 
 #[test]
@@ -643,13 +684,13 @@ fn search_accepts_relative_since_days() {
     write_session(
         &source,
         "ancient",
-        "/Users/me/projects/palabruno",
+        "/Users/me/projects/acme-api",
         "1970-01-01T01:00:00Z",
     );
     write_session(
         &source,
         "future",
-        "/Users/me/projects/palabruno",
+        "/Users/me/projects/acme-api",
         "2999-01-01T01:00:00Z",
     );
 
@@ -884,6 +925,7 @@ fn status_json_reports_pending_files_without_creating_missing_database() {
     assert_eq!(json["freshness"], "watcher-not-running");
     assert_eq!(json["pending_files"], 1);
     assert_eq!(json["last_error"], serde_json::Value::Null);
+    assert_eq!(json["launch_agent"]["supported"], cfg!(target_os = "macos"));
     assert!(!db.exists(), "status should not create the database");
 }
 
@@ -927,6 +969,7 @@ fn status_json_reports_fresh_and_live_write_verdicts() {
     let json: serde_json::Value = serde_json::from_slice(&fresh.stdout).unwrap();
     assert_eq!(json["freshness"], "fresh");
     assert_eq!(json["freshness_message"], "index is current");
+    assert_eq!(json["launch_agent"]["supported"], cfg!(target_os = "macos"));
 
     write_session_file(
         &source,
@@ -1533,7 +1576,7 @@ fn pins_filter_by_command_cwd_repo_membership() {
     fs::create_dir_all(&session_dir).unwrap();
     fs::write(
         session_dir.join("mixed-repo.jsonl"),
-        r#"{"timestamp":"2026-04-13T01:00:00Z","type":"session_meta","payload":{"id":"mixed-repo","timestamp":"2026-04-13T01:00:00Z","cwd":"/Users/me/hanif-md","cli_version":"0.1.0"}}
+        r#"{"timestamp":"2026-04-13T01:00:00Z","type":"session_meta","payload":{"id":"mixed-repo","timestamp":"2026-04-13T01:00:00Z","cwd":"/Users/me/notes-vault","cli_version":"0.1.0"}}
 {"timestamp":"2026-04-13T01:00:01Z","type":"event_msg","payload":{"type":"exec_command_end","command":["/bin/zsh","-lc","cargo test"],"cwd":"/Users/me/projects/codex-recall","exit_code":0,"aggregated_output":"watcher freshness tested"}}
 "#,
     )

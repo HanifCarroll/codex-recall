@@ -1,6 +1,6 @@
 use crate::commands::index::resolve_sources;
 use crate::commands::watch::{build_status_report, status_json};
-use crate::config::{default_db_path, default_state_path};
+use crate::config::{default_db_path, default_state_path, DEFAULT_LAUNCH_AGENT_LABEL};
 use crate::store::Store;
 use anyhow::Result;
 use clap::Args;
@@ -26,7 +26,7 @@ pub struct DoctorArgs {
     pub quiet_for: u64,
     #[arg(
         long,
-        default_value = "com.hanif.codex-recall.watch",
+        default_value = DEFAULT_LAUNCH_AGENT_LABEL,
         help = "LaunchAgent label"
     )]
     pub agent_label: String,

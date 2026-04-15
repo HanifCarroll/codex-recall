@@ -2,16 +2,53 @@
 
 Local search and recall for Codex session JSONL archives.
 
-`codex-recall` indexes Codex transcripts from:
-
-- `~/.codex/sessions`
-- `~/.codex/archived_sessions`
-
-It stores a disposable SQLite FTS5 index at:
-
-- `~/.local/share/codex-recall/index.sqlite`
+`codex-recall` builds a disposable SQLite FTS5 index over transcript archives so you can search, inspect, and reuse prior session context without treating raw JSONL logs as a database.
 
 Raw JSONL files remain the source of truth.
+
+## Install
+
+```bash
+cargo install --path .
+```
+
+Or install directly from GitHub:
+
+```bash
+cargo install --git https://github.com/HanifCarroll/codex-recall
+```
+
+## Support Scope
+
+- Works anywhere you have Codex-style session JSONL archives on disk.
+- Defaults to `~/.codex/sessions` and `~/.codex/archived_sessions`.
+- Honors `CODEX_HOME` when Codex data lives somewhere else.
+- Stores index and pin data under XDG-style data/state paths when available, otherwise falls back to `~/.local/share` and `~/.local/state`.
+- `watch --install-launch-agent` is macOS-only because it writes and manages a LaunchAgent plist.
+
+## Default Paths
+
+Source roots:
+
+- `$CODEX_HOME/sessions`
+- `$CODEX_HOME/archived_sessions`
+- or, when `CODEX_HOME` is unset:
+  - `~/.codex/sessions`
+  - `~/.codex/archived_sessions`
+
+Index and state files:
+
+- `$CODEX_RECALL_DB` overrides the SQLite path
+- `$CODEX_RECALL_STATE` overrides the watch state path
+- `$CODEX_RECALL_PINS` overrides the pins path
+- otherwise:
+  - `$XDG_DATA_HOME/codex-recall/index.sqlite`
+  - `$XDG_DATA_HOME/codex-recall/pins.json`
+  - `$XDG_STATE_HOME/codex-recall/watch.json`
+- with fallback to:
+  - `~/.local/share/codex-recall/index.sqlite`
+  - `~/.local/share/codex-recall/pins.json`
+  - `~/.local/state/codex-recall/watch.json`
 
 ## Commands
 
@@ -23,19 +60,19 @@ codex-recall watch --once
 codex-recall watch --install-launch-agent --start-launch-agent
 codex-recall status
 codex-recall status --json
-codex-recall search "Stripe webhook"
-codex-recall search "Stripe webhook" --repo palabruno --since 2026-04-01
-codex-recall search "Stripe webhook" --from 2026-04-01 --until 2026-04-14
-codex-recall search "Stripe webhook" --day 2026-04-13 --kind assistant --json
-codex-recall search "Stripe webhook" --since 7d
-codex-recall search "Stripe webhook" --cwd projects/palabruno
-codex-recall search "Stripe webhook" --exclude-session <session-id-or-session-key>
-codex-recall search "Stripe webhook" --exclude-current
-codex-recall search "Stripe webhook" --json
-codex-recall recent --repo palabruno --since 7d
+codex-recall search "payment webhook"
+codex-recall search "payment webhook" --repo acme-api --since 2026-04-01
+codex-recall search "payment webhook" --from 2026-04-01 --until 2026-04-14
+codex-recall search "payment webhook" --day 2026-04-13 --kind assistant --json
+codex-recall search "payment webhook" --since 7d
+codex-recall search "payment webhook" --cwd projects/acme-api
+codex-recall search "payment webhook" --exclude-session <session-id-or-session-key>
+codex-recall search "payment webhook" --exclude-current
+codex-recall search "payment webhook" --json
+codex-recall recent --repo acme-api --since 7d
 codex-recall recent --day 2026-04-13 --json
 codex-recall day 2026-04-13 --json
-codex-recall bundle "Stripe webhook" --repo palabruno --since 14d
+codex-recall bundle "payment webhook" --repo acme-api --since 14d
 codex-recall show <session-id-or-session-key> --json
 codex-recall pin <session-key> --label "watcher design"
 codex-recall pins --repo codex-recall
@@ -86,7 +123,7 @@ codex-recall unpin <session-key> --pins /tmp/pins.json
 - Boosts results from the current git repo by default. Use `--repo` to filter to a repo, or `--all-repos` to disable the current-repo boost.
 - Tracks file size and mtime so repeat indexing skips unchanged sessions.
 - Reports indexing progress to stderr with discovered file totals, bytes processed, elapsed time, ETA, current file, and skipped-file reason counts.
-- Watches session roots with a polling freshness loop, waits for files to be quiet before indexing, and records watcher state in `~/.local/state/codex-recall/watch.json`.
+- Watches session roots with a polling freshness loop, waits for files to be quiet before indexing, and records watcher state in the configured state path.
 - Reports a blunt freshness verdict: `fresh`, `stale`, `pending-live-writes`, or `watcher-not-running`.
 - Reports freshness status with pending file counts, stable/waiting file counts, last indexed time, last watcher error, and LaunchAgent installed/running state.
 - Can write a macOS LaunchAgent plist for the watcher with `watch --install-launch-agent`.
@@ -96,7 +133,7 @@ codex-recall unpin <session-key> --pins /tmp/pins.json
 - Prints machine-readable `recent --json`, `show --json`, and `day --json` output for automation.
 - Prints a day inventory with `day YYYY-MM-DD --json`, including session records plus repo and cwd counts.
 - Formats search results into an agent-ready context bundle with top sessions, receipts, and follow-up `show` commands.
-- Stores durable labeled pins in `~/.local/share/codex-recall/pins.json`, outside the disposable SQLite index.
+- Stores durable labeled pins outside the disposable SQLite index.
 - Ranks sessions by current-repo match, hit count, event kind, FTS rank, and recency.
 - Reports source-file counts and duplicate source-file counts in `stats`.
 - Keeps `--json` output compact by returning `text_preview` instead of full transcript blobs.
@@ -113,8 +150,7 @@ codex-recall doctor
 codex-recall doctor --json
 ```
 
-`doctor` is read-only when the database is missing; it reports the missing index instead of creating an empty one.
-`doctor --json` includes a `freshness` block so agents can distinguish an unhealthy database from a healthy-but-stale index.
+`doctor` is read-only when the database is missing. It reports the missing index instead of creating an empty one.
 
 Use `rebuild` when the disposable SQLite index should be recreated from the raw JSONL source files:
 
@@ -122,22 +158,21 @@ Use `rebuild` when the disposable SQLite index should be recreated from the raw 
 codex-recall rebuild
 ```
 
-Use `watch` when the index should stay fresh while Codex or Hermes writes new transcripts:
+Use `watch` when the index should stay fresh while Codex writes new transcripts:
 
 ```bash
 codex-recall watch
 codex-recall status
 ```
 
-`watch --install-launch-agent` writes a plist to `~/Library/LaunchAgents/com.hanif.codex-recall.watch.plist` and prints the `launchctl bootstrap` command to start it.
-`watch --install-launch-agent --start-launch-agent` writes the plist, runs `launchctl bootstrap`, and verifies the job with `launchctl print`.
+On macOS, `watch --install-launch-agent` writes a plist to `~/Library/LaunchAgents/dev.codex-recall.watch.plist` by default and prints the `launchctl bootstrap` command to start it.
 
 Use `bundle` when an agent needs compact prior-session context:
 
 ```bash
-codex-recall bundle "Hermes global skills" --since 14d --limit 5
-codex-recall bundle "Hermes global skills" --from 2026-04-13 --until 2026-04-14 --limit 5
-codex-recall bundle "Hermes global skills" --day 2026-04-13 --kind assistant --limit 5
+codex-recall bundle "launch agent watcher" --since 14d --limit 5
+codex-recall bundle "launch agent watcher" --from 2026-04-13 --until 2026-04-14 --limit 5
+codex-recall bundle "launch agent watcher" --day 2026-04-13 --kind assistant --limit 5
 ```
 
 Use `recent` when you do not know the right query yet:
@@ -163,7 +198,7 @@ codex-recall unpin <session-key>
 When an agent needs prior-session context:
 
 1. Run `codex-recall status --json`.
-2. If `freshness` is `fresh` or `pending-live-writes`, continue. `pending-live-writes` means very recent files are still settling; use existing results unless the current turn depends on the last few seconds.
+2. If `freshness` is `fresh` or `pending-live-writes`, continue. `pending-live-writes` means very recent files are still settling, so use existing results unless the current turn depends on the last few seconds.
 3. If `freshness` is `stale`, run `codex-recall watch --once --quiet-for 0` or `codex-recall index`, then check `status --json` again.
 4. If `freshness` is `watcher-not-running`, start the background watcher with `codex-recall watch --install-launch-agent --start-launch-agent`, then run `codex-recall watch --once --quiet-for 0` for an immediate catch-up.
 5. Use `codex-recall recent --repo <repo> --since 7d --limit 10` when you do not know the right search terms yet.
@@ -171,7 +206,7 @@ When an agent needs prior-session context:
 7. Use `codex-recall bundle "<query>" --repo <repo> --day YYYY-MM-DD --limit 5` for compact context.
 8. Use `codex-recall search "<query>" --json --day YYYY-MM-DD --exclude-current` when programmatic filtering is needed during an automation.
 9. Use `--kind user`, `--kind assistant`, or `--kind command` to narrow noisy searches.
-10. Add `--exclude-session <session-id-or-session-key>` when the current automation/session id is known and `--exclude-current` is unavailable.
+10. Add `--exclude-session <session-id-or-session-key>` when the current automation or session id is known and `--exclude-current` is unavailable.
 11. Keep the default deduped view unless the question is specifically about active/archive divergence. Use `--include-duplicates` only for that inspection.
 12. Use `codex-recall show <session_key> --json` only for sessions that look relevant from `bundle`, `search`, `day`, or `recent`.
 13. Use `codex-recall pin <session_key> --label "<why this matters>"` for canonical decisions or sessions that are likely to be reused.
@@ -179,8 +214,6 @@ When an agent needs prior-session context:
 15. Use `codex-recall unpin <session_key>` when a memory anchor is stale or mistaken.
 16. Treat transcript evidence as historical. Verify against the current repo before acting.
 
-## Local Verification
+## Verification Notes
 
-The April 13, 2026 full historical rebuild on this machine parsed 1,090 session files and 485,037 events in about 28 minutes. Large live archives can have long gaps between files, so use stderr progress for current-file and ETA visibility.
-
-A repeat index run skips unchanged files and should finish much faster.
+In development, a full rebuild across a four-digit session-file archive completed in tens of minutes, and repeat indexing runs were much faster because unchanged files were skipped.

@@ -46,7 +46,7 @@ fn quality_fixture_prioritizes_relevant_repo_membership_and_fallbacks() {
         &source,
         "right-command-cwd.jsonl",
         &format!(
-            r#"{{"timestamp":"2026-04-13T01:00:00Z","type":"session_meta","payload":{{"id":"right-command-cwd","timestamp":"2026-04-13T01:00:00Z","cwd":"/Users/me/hanif-md","cli_version":"0.1.0"}}}}
+            r#"{{"timestamp":"2026-04-13T01:00:00Z","type":"session_meta","payload":{{"id":"right-command-cwd","timestamp":"2026-04-13T01:00:00Z","cwd":"/Users/me/notes-vault","cli_version":"0.1.0"}}}}
 {{"timestamp":"2026-04-13T01:00:01Z","type":"event_msg","payload":{{"type":"user_message","message":"Dogfood recall ranking against the current repository."}}}}
 {{"timestamp":"2026-04-13T01:00:02Z","type":"event_msg","payload":{{"type":"exec_command_end","command":["/bin/zsh","-lc","rg dogfood"],"cwd":"{}","exit_code":0,"aggregated_output":"dogfood ranking receipt"}}}}
 "#,

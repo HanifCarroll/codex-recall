@@ -1,5 +1,5 @@
 use crate::commands::index::resolve_sources;
-use crate::config::{default_db_path, default_state_path};
+use crate::config::{default_db_path, default_state_path, DEFAULT_LAUNCH_AGENT_LABEL};
 use crate::indexer::{index_sources_with_progress, scan_sources_for_pending, SourceScanReport};
 use crate::output::{format_bytes, now_timestamp, progress_line};
 use crate::store::Store;
@@ -38,7 +38,7 @@ pub struct WatchArgs {
     pub start_launch_agent: bool,
     #[arg(
         long,
-        default_value = "com.hanif.codex-recall.watch",
+        default_value = DEFAULT_LAUNCH_AGENT_LABEL,
         help = "LaunchAgent label"
     )]
     pub agent_label: String,
@@ -64,7 +64,7 @@ pub struct StatusArgs {
     pub json: bool,
     #[arg(
         long,
-        default_value = "com.hanif.codex-recall.watch",
+        default_value = DEFAULT_LAUNCH_AGENT_LABEL,
         help = "LaunchAgent label"
     )]
     pub agent_label: String,
@@ -107,6 +107,7 @@ pub(crate) struct FreshnessVerdict {
 pub(crate) struct LaunchAgentStatus {
     pub label: String,
     pub path: PathBuf,
+    pub supported: bool,
     pub installed: bool,
     pub running: Option<bool>,
 }
@@ -119,6 +120,11 @@ pub fn run_watch(args: WatchArgs) -> Result<()> {
     let quiet_for = Duration::from_secs(args.quiet_for);
 
     if args.install_launch_agent {
+        if !launch_agent_supported() {
+            return Err(anyhow!(
+                "watch --install-launch-agent is only supported on macOS"
+            ));
+        }
         let agent_path = args
             .agent_path
             .unwrap_or(default_launch_agent_path(&args.agent_label)?);
@@ -279,16 +285,24 @@ pub fn run_status(args: StatusArgs) -> Result<()> {
             .clone()
             .unwrap_or_else(|| "none".to_owned())
     );
-    println!(
-        "launch_agent: {} (installed: {}, running: {})",
-        report.launch_agent.label,
-        report.launch_agent.installed,
-        report
-            .launch_agent
-            .running
-            .map(|running| running.to_string())
-            .unwrap_or_else(|| "unknown".to_owned())
-    );
+    if report.launch_agent.supported {
+        println!(
+            "launch_agent: {} (installed: {}, running: {})",
+            report.launch_agent.label,
+            report.launch_agent.installed,
+            report
+                .launch_agent
+                .running
+                .map(|running| running.to_string())
+                .unwrap_or_else(|| "unknown".to_owned())
+        );
+    } else {
+        println!(
+            "launch_agent: unsupported on this platform (label: {}, path: {})",
+            report.launch_agent.label,
+            report.launch_agent.path.display()
+        );
+    }
     for source in report.sources {
         let status = if source.exists() { "exists" } else { "missing" };
         println!("source: {} ({status})", source.display());
@@ -346,6 +360,7 @@ pub(crate) fn status_json(report: &WatchStatusReport) -> Value {
         "launch_agent": {
             "label": report.launch_agent.label,
             "path": report.launch_agent.path,
+            "supported": report.launch_agent.supported,
             "installed": report.launch_agent.installed,
             "running": report.launch_agent.running,
         },
@@ -411,7 +426,8 @@ fn freshness_verdict(
 }
 
 fn launch_agent_status(label: String, path: PathBuf) -> LaunchAgentStatus {
-    let installed = path.exists();
+    let supported = launch_agent_supported();
+    let installed = supported && path.exists();
     let running = if installed {
         Some(is_launch_agent_running(&label))
     } else {
@@ -421,6 +437,7 @@ fn launch_agent_status(label: String, path: PathBuf) -> LaunchAgentStatus {
     LaunchAgentStatus {
         label,
         path,
+        supported,
         installed,
         running,
     }
@@ -438,6 +455,9 @@ fn is_launch_agent_running(label: &str) -> bool {
 }
 
 fn start_launch_agent(label: &str, path: &Path) -> Result<()> {
+    if !launch_agent_supported() {
+        return Err(anyhow!("launchctl integration is only supported on macOS"));
+    }
     let domain = launch_agent_domain()?;
     let bootstrap = ProcessCommand::new(launchctl_executable())
         .args(["bootstrap", &domain])
@@ -515,6 +535,10 @@ fn launch_agent_domain() -> Result<String> {
 
 fn launchctl_executable() -> OsString {
     std::env::var_os("CODEX_RECALL_LAUNCHCTL").unwrap_or_else(|| OsString::from("launchctl"))
+}
+
+fn launch_agent_supported() -> bool {
+    cfg!(target_os = "macos")
 }
 
 fn scan_status(

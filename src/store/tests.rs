@@ -198,7 +198,7 @@ fn ranks_current_repo_when_only_a_command_ran_inside_that_repo() {
 
     let mut project_session = sample_session_with(
         "project",
-        "/Users/me/hanif-md",
+        "/Users/me/notes-vault",
         "2026-04-01T01:00:00Z",
         "/tmp/project-command.jsonl",
     );
@@ -233,7 +233,7 @@ fn ranks_current_repo_when_only_a_command_ran_inside_that_repo() {
         .unwrap();
 
     assert_eq!(results[0].session_id, "project");
-    assert_eq!(results[0].repo, "hanif-md");
+    assert_eq!(results[0].repo, "notes-vault");
 }
 
 #[test]
@@ -241,16 +241,16 @@ fn filters_search_by_repo_cwd_and_since() {
     let store = Store::open(temp_db_path("filters")).unwrap();
     store
         .index_session(&sample_session_with(
-            "old-palabruno",
-            "/Users/me/projects/palabruno",
+            "old-acme-api",
+            "/Users/me/projects/acme-api",
             "2026-04-01T01:00:00Z",
             "/tmp/old.jsonl",
         ))
         .unwrap();
     store
         .index_session(&sample_session_with(
-            "new-palabruno",
-            "/Users/me/projects/palabruno",
+            "new-acme-api",
+            "/Users/me/projects/acme-api",
             "2026-04-13T01:00:00Z",
             "/tmp/new.jsonl",
         ))
@@ -258,7 +258,7 @@ fn filters_search_by_repo_cwd_and_since() {
     store
         .index_session(&sample_session_with(
             "genrupt",
-            "/Users/me/projects/Genrupt",
+            "/Users/me/projects/ops-tool",
             "2026-04-13T01:00:00Z",
             "/tmp/genrupt.jsonl",
         ))
@@ -268,8 +268,8 @@ fn filters_search_by_repo_cwd_and_since() {
         .search_with_options(SearchOptions {
             query: "webhook secret".to_owned(),
             limit: 10,
-            repo: Some("palabruno".to_owned()),
-            cwd: Some("projects/palabruno".to_owned()),
+            repo: Some("acme-api".to_owned()),
+            cwd: Some("projects/acme-api".to_owned()),
             since: Some("2026-04-10".to_owned()),
             from: None,
             until: None,
@@ -281,8 +281,8 @@ fn filters_search_by_repo_cwd_and_since() {
         .unwrap();
 
     assert_eq!(results.len(), 1);
-    assert_eq!(results[0].session_id, "new-palabruno");
-    assert_eq!(results[0].repo, "palabruno");
+    assert_eq!(results[0].session_id, "new-acme-api");
+    assert_eq!(results[0].repo, "acme-api");
 }
 
 #[test]
