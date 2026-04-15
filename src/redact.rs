@@ -128,7 +128,7 @@ mod tests {
         let text =
             "The webhook secret was missing. API_KEY=abc123456789 SENTRY_DSN=https://public@dsn";
 
-        let redacted = redact_secrets(&text);
+        let redacted = redact_secrets(text);
 
         assert!(redacted.contains("The webhook secret was missing."));
         assert!(redacted.contains("API_KEY=[REDACTED]"));
