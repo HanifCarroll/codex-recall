@@ -3,6 +3,7 @@ pub mod doctor;
 pub mod exclude;
 pub mod index;
 pub mod kind;
+pub mod memory;
 pub mod pins;
 pub mod recent;
 pub mod search;

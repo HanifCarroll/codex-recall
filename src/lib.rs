@@ -2,6 +2,7 @@ pub mod cli;
 mod commands;
 pub mod config;
 pub mod indexer;
+pub mod memory;
 mod output;
 pub mod parser;
 pub mod redact;

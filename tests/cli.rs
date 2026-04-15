@@ -80,6 +80,32 @@ fn write_mixed_session_file(
     .unwrap();
 }
 
+fn write_memory_session_file(
+    root: &std::path::Path,
+    file_name: &str,
+    id: &str,
+    cwd: &str,
+    timestamp: &str,
+    events: &[(&str, &str)],
+) {
+    let session_dir = root.join("2026/04/13");
+    fs::create_dir_all(&session_dir).unwrap();
+    let mut contents = format!(
+        r#"{{"timestamp":"{timestamp}","type":"session_meta","payload":{{"id":"{id}","timestamp":"{timestamp}","cwd":"{cwd}","cli_version":"0.1.0"}}}}
+"#
+    );
+    for (offset, (event_type, message)) in events.iter().enumerate() {
+        contents.push_str(&format!(
+            r#"{{"timestamp":"{timestamp}","type":"event_msg","payload":{{"type":"{event_type}","message":"{message}"}}}}
+"#
+        ));
+        if offset + 1 == events.len() {
+            contents.push('\n');
+        }
+    }
+    fs::write(session_dir.join(file_name), contents).unwrap();
+}
+
 fn index_sources(db: &std::path::Path, sources: &[&std::path::Path]) {
     let mut command = Command::new(env!("CARGO_BIN_EXE_codex-recall"));
     command.args(["index", "--db"]).arg(db);
@@ -895,6 +921,434 @@ fn index_reports_progress_for_larger_sources() {
     assert!(stderr.contains("elapsed"), "{stderr}");
     assert!(stderr.contains("eta"), "{stderr}");
     assert!(stderr.contains("current "), "{stderr}");
+}
+
+#[test]
+fn memories_json_extracts_stable_objects_and_consolidates_evidence() {
+    let temp = temp_dir("memories-json");
+    let source = temp.join("sessions");
+    let db = temp.join("index.sqlite");
+    write_memory_session_file(
+        &source,
+        "first.jsonl",
+        "memory-session-1",
+        "/Users/me/projects/palabruno",
+        "2026-04-13T01:00:00Z",
+        &[
+            (
+                "agent_message",
+                "Decision: Teacher stays web-only and mobile billing is Premium-only.",
+            ),
+            (
+                "agent_message",
+                "Next step: attach the iOS build to App Store Connect.",
+            ),
+            (
+                "agent_message",
+                "Blocked: cargo publish is waiting on a crates.io token.",
+            ),
+        ],
+    );
+    write_memory_session_file(
+        &source,
+        "second.jsonl",
+        "memory-session-2",
+        "/Users/me/projects/palabruno",
+        "2026-04-13T02:00:00Z",
+        &[(
+            "agent_message",
+            "Decision: Teacher stays web-only and mobile billing is Premium-only.",
+        )],
+    );
+    index_sources(&db, &[&source]);
+
+    let memories = Command::new(env!("CARGO_BIN_EXE_codex-recall"))
+        .args(["memories", "--json", "--db"])
+        .arg(&db)
+        .output()
+        .unwrap();
+    assert!(
+        memories.status.success(),
+        "memories failed: {}",
+        String::from_utf8_lossy(&memories.stderr)
+    );
+
+    let json: serde_json::Value = serde_json::from_slice(&memories.stdout).unwrap();
+    assert_eq!(json["object"], "list");
+    let results = json["results"].as_array().unwrap();
+    assert!(
+        results.len() >= 3,
+        "{}",
+        serde_json::to_string_pretty(&json).unwrap()
+    );
+
+    let decision = results
+        .iter()
+        .find(|item| item["kind"] == "decision")
+        .unwrap();
+    assert_eq!(decision["object"], "memory");
+    assert!(decision["id"]
+        .as_str()
+        .unwrap()
+        .starts_with("mem_decision_"));
+    assert_eq!(decision["evidence_count"], 2);
+    assert_eq!(
+        decision["summary"],
+        "Teacher stays web-only and mobile billing is Premium-only."
+    );
+    assert_eq!(
+        decision["resource_uri"],
+        format!("codex-recall://memory/{}", decision["id"].as_str().unwrap())
+    );
+}
+
+#[test]
+fn memory_resources_and_read_resource_return_mcp_ready_json() {
+    let temp = temp_dir("memory-resources");
+    let source = temp.join("sessions");
+    let db = temp.join("index.sqlite");
+    write_memory_session_file(
+        &source,
+        "resource.jsonl",
+        "resource-session",
+        "/Users/me/projects/codex-recall",
+        "2026-04-13T01:00:00Z",
+        &[(
+            "agent_message",
+            "Decision: Keep the watcher LaunchAgent generic.",
+        )],
+    );
+    index_sources(&db, &[&source]);
+
+    let resources = Command::new(env!("CARGO_BIN_EXE_codex-recall"))
+        .args(["resources", "--kind", "memory", "--json", "--db"])
+        .arg(&db)
+        .output()
+        .unwrap();
+    assert!(
+        resources.status.success(),
+        "resources failed: {}",
+        String::from_utf8_lossy(&resources.stderr)
+    );
+    let resources_json: serde_json::Value = serde_json::from_slice(&resources.stdout).unwrap();
+    assert_eq!(resources_json["object"], "resource_list");
+    let uri = resources_json["resources"][0]["uri"]
+        .as_str()
+        .unwrap()
+        .to_owned();
+    assert!(uri.starts_with("codex-recall://memory/"), "{uri}");
+
+    let read = Command::new(env!("CARGO_BIN_EXE_codex-recall"))
+        .args(["read-resource", &uri, "--db"])
+        .arg(&db)
+        .output()
+        .unwrap();
+    assert!(
+        read.status.success(),
+        "read-resource failed: {}",
+        String::from_utf8_lossy(&read.stderr)
+    );
+    let read_json: serde_json::Value = serde_json::from_slice(&read.stdout).unwrap();
+    assert_eq!(read_json["object"], "memory");
+    assert_eq!(read_json["resource_uri"], uri);
+    assert_eq!(read_json["evidence"][0]["session_id"], "resource-session");
+}
+
+#[test]
+fn delta_uses_cursors_for_incremental_sessions_and_memories() {
+    let temp = temp_dir("delta");
+    let source = temp.join("sessions");
+    let db = temp.join("index.sqlite");
+    write_memory_session_file(
+        &source,
+        "first.jsonl",
+        "delta-session-1",
+        "/Users/me/projects/codex-recall",
+        "2026-04-13T01:00:00Z",
+        &[("agent_message", "Decision: Keep MCP resources JSON-only.")],
+    );
+    index_sources(&db, &[&source]);
+
+    let first = Command::new(env!("CARGO_BIN_EXE_codex-recall"))
+        .args(["delta", "--json", "--db"])
+        .arg(&db)
+        .output()
+        .unwrap();
+    assert!(
+        first.status.success(),
+        "delta failed: {}",
+        String::from_utf8_lossy(&first.stderr)
+    );
+    let first_json: serde_json::Value = serde_json::from_slice(&first.stdout).unwrap();
+    let cursor = first_json["next_cursor"].as_str().unwrap().to_owned();
+    assert!(first_json["items"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .any(|item| item["object"] == "memory"));
+    assert!(first_json["items"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .any(|item| item["object"] == "session"));
+
+    write_memory_session_file(
+        &source,
+        "second.jsonl",
+        "delta-session-2",
+        "/Users/me/projects/codex-recall",
+        "2026-04-13T02:00:00Z",
+        &[(
+            "agent_message",
+            "Next step: wire delta cursors into the CLI.",
+        )],
+    );
+    index_sources(&db, &[&source]);
+
+    let second = Command::new(env!("CARGO_BIN_EXE_codex-recall"))
+        .args(["delta", "--cursor", &cursor, "--json", "--db"])
+        .arg(&db)
+        .output()
+        .unwrap();
+    assert!(
+        second.status.success(),
+        "delta with cursor failed: {}",
+        String::from_utf8_lossy(&second.stderr)
+    );
+    let second_json: serde_json::Value = serde_json::from_slice(&second.stdout).unwrap();
+    let items = second_json["items"].as_array().unwrap();
+    assert!(
+        !items.is_empty(),
+        "{}",
+        serde_json::to_string_pretty(&second_json).unwrap()
+    );
+    assert!(items.iter().all(|item| {
+        item["session_id"] == "delta-session-2"
+            || item["summary"] == "wire delta cursors into the CLI."
+    }));
+}
+
+#[test]
+fn related_finds_sessions_and_memories_via_shared_memory_objects() {
+    let temp = temp_dir("related");
+    let source = temp.join("sessions");
+    let db = temp.join("index.sqlite");
+    write_memory_session_file(
+        &source,
+        "first.jsonl",
+        "related-session-1",
+        "/Users/me/projects/codex-recall",
+        "2026-04-13T01:00:00Z",
+        &[
+            (
+                "agent_message",
+                "Decision: Keep the watcher LaunchAgent generic.",
+            ),
+            (
+                "agent_message",
+                "Task: add a resources command for MCP clients.",
+            ),
+        ],
+    );
+    write_memory_session_file(
+        &source,
+        "second.jsonl",
+        "related-session-2",
+        "/Users/me/projects/codex-recall",
+        "2026-04-13T02:00:00Z",
+        &[(
+            "agent_message",
+            "Decision: Keep the watcher LaunchAgent generic.",
+        )],
+    );
+    index_sources(&db, &[&source]);
+
+    let related = Command::new(env!("CARGO_BIN_EXE_codex-recall"))
+        .args(["related", "related-session-1", "--json", "--db"])
+        .arg(&db)
+        .output()
+        .unwrap();
+    assert!(
+        related.status.success(),
+        "related failed: {}",
+        String::from_utf8_lossy(&related.stderr)
+    );
+
+    let json: serde_json::Value = serde_json::from_slice(&related.stdout).unwrap();
+    assert_eq!(json["object"], "related_context");
+    assert_eq!(json["reference"]["object"], "session");
+    assert!(json["sessions"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .any(|session| session["session_id"] == "related-session-2"));
+    assert!(json["memories"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .any(|memory| memory["kind"] == "decision"));
+}
+
+#[test]
+fn search_trace_and_eval_fixture_work_for_agent_memory_retrieval() {
+    let temp = temp_dir("trace-eval");
+    let source = temp.join("sessions");
+    let db = temp.join("index.sqlite");
+    write_memory_session_file(
+        &source,
+        "trace.jsonl",
+        "trace-session",
+        "/Users/me/projects/codex-recall",
+        "2026-04-13T01:00:00Z",
+        &[(
+            "agent_message",
+            "Decision: Keep resources exposed as codex-recall URIs.",
+        )],
+    );
+    index_sources(&db, &[&source]);
+
+    let search = Command::new(env!("CARGO_BIN_EXE_codex-recall"))
+        .args(["search", "codex-recall uris", "--trace", "--json", "--db"])
+        .arg(&db)
+        .output()
+        .unwrap();
+    assert!(
+        search.status.success(),
+        "search failed: {}",
+        String::from_utf8_lossy(&search.stderr)
+    );
+    let search_json: serde_json::Value = serde_json::from_slice(&search.stdout).unwrap();
+    assert_eq!(search_json["match_strategy"], "all_terms");
+    assert_eq!(
+        search_json["trace"]["fts_query"],
+        "\"codex\" AND \"recall\" AND \"uris\""
+    );
+    assert_eq!(search_json["trace"]["query_terms"][0], "codex");
+    assert!(
+        search_json["results"][0]["trace"]["session_hit_count"]
+            .as_u64()
+            .unwrap()
+            >= 1
+    );
+    assert!(search_json["results"][0]["trace"]["fts_score"].is_number());
+    assert!(search_json["results"][0]["trace"]["source_priority"].is_number());
+    assert_eq!(
+        search_json["results"][0]["trace"]["duplicate_session_id"],
+        "trace-session"
+    );
+
+    let fixture = temp.join("eval.json");
+    fs::write(
+        &fixture,
+        r#"{
+  "cases": [
+    {
+      "name": "search recall",
+      "command": "search",
+      "query": "codex-recall uris",
+      "expected": { "session_id": "trace-session" }
+    },
+    {
+      "name": "memory recall",
+      "command": "memories",
+      "query": "codex-recall uris",
+      "expected": {
+        "top_memory_kind": "decision",
+        "top_memory_summary_contains": "codex-recall URIs"
+      }
+    },
+    {
+      "name": "delta change feed",
+      "command": "delta",
+      "expected": {
+        "contains_session_id": "trace-session",
+        "contains_memory_kind": "decision",
+        "next_cursor_present": true
+      }
+    }
+  ]
+}"#,
+    )
+    .unwrap();
+
+    let eval = Command::new(env!("CARGO_BIN_EXE_codex-recall"))
+        .args(["eval", fixture.to_str().unwrap(), "--json", "--db"])
+        .arg(&db)
+        .output()
+        .unwrap();
+    assert!(
+        eval.status.success(),
+        "eval failed: {}",
+        String::from_utf8_lossy(&eval.stderr)
+    );
+    let eval_json: serde_json::Value = serde_json::from_slice(&eval.stdout).unwrap();
+    assert_eq!(eval_json["object"], "eval_result");
+    assert_eq!(eval_json["passed"], 3);
+    assert_eq!(eval_json["failed"], 0);
+}
+
+#[test]
+fn delta_cursor_uses_monotonic_change_feed_ids() {
+    let temp = temp_dir("delta-change-feed");
+    let source = temp.join("sessions");
+    let db = temp.join("index.sqlite");
+    write_memory_session_file(
+        &source,
+        "first.jsonl",
+        "change-feed-1",
+        "/Users/me/projects/codex-recall",
+        "2026-04-13T01:00:00Z",
+        &[(
+            "agent_message",
+            "Decision: Keep the delta feed append-only.",
+        )],
+    );
+    index_sources(&db, &[&source]);
+
+    let first = Command::new(env!("CARGO_BIN_EXE_codex-recall"))
+        .args(["delta", "--json", "--db"])
+        .arg(&db)
+        .output()
+        .unwrap();
+    assert!(first.status.success());
+    let first_json: serde_json::Value = serde_json::from_slice(&first.stdout).unwrap();
+    let first_cursor = first_json["next_cursor"].as_str().unwrap().to_owned();
+    assert!(first_cursor.starts_with("chg_"), "{first_cursor}");
+    assert!(first_json["items"].as_array().unwrap()[0]["change_id"].is_number());
+    assert_eq!(
+        first_json["items"].as_array().unwrap()[0]["change_kind"],
+        "session"
+    );
+
+    write_memory_session_file(
+        &source,
+        "second.jsonl",
+        "change-feed-2",
+        "/Users/me/projects/codex-recall",
+        "2026-04-13T02:00:00Z",
+        &[(
+            "agent_message",
+            "Task: add stronger trace fields for search.",
+        )],
+    );
+    index_sources(&db, &[&source]);
+
+    let second = Command::new(env!("CARGO_BIN_EXE_codex-recall"))
+        .args(["delta", "--cursor", &first_cursor, "--json", "--db"])
+        .arg(&db)
+        .output()
+        .unwrap();
+    assert!(second.status.success());
+    let second_json: serde_json::Value = serde_json::from_slice(&second.stdout).unwrap();
+    let items = second_json["items"].as_array().unwrap();
+    assert!(!items.is_empty());
+    assert!(items
+        .iter()
+        .all(|item| item["change_id"].as_u64().unwrap() > 0));
+    assert!(items
+        .iter()
+        .any(|item| item["session_id"] == "change-feed-2"));
+    assert!(items.iter().any(|item| item["kind"] == "task"));
 }
 
 #[test]
