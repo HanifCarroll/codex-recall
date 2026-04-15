@@ -62,6 +62,31 @@ fn sample_session_with(id: &str, cwd: &str, timestamp: &str, source_path: &str) 
     }
 }
 
+fn memory_session_with(id: &str, cwd: &str, timestamp: &str, source_path: &str) -> ParsedSession {
+    let source = PathBuf::from(source_path);
+    ParsedSession {
+        session: SessionMetadata {
+            id: id.to_owned(),
+            timestamp: timestamp.to_owned(),
+            cwd: cwd.to_owned(),
+            cli_version: Some("0.1.0".to_owned()),
+            source_file_path: source.clone(),
+        },
+        events: vec![ParsedEvent {
+            session_id: id.to_owned(),
+            kind: EventKind::AssistantMessage,
+            role: Some("assistant".to_owned()),
+            text: "Decision: Keep the delta feed append-only.".to_owned(),
+            command: None,
+            cwd: None,
+            exit_code: None,
+            source_timestamp: Some("2026-04-13T01:00:02Z".to_owned()),
+            source_file_path: source,
+            source_line_number: 3,
+        }],
+    }
+}
+
 #[test]
 fn indexes_sessions_idempotently_and_counts_rows() {
     let store = Store::open(temp_db_path("idempotent")).unwrap();
@@ -90,6 +115,61 @@ fn searches_fts_with_source_provenance() {
     assert_eq!(results[0].cwd, "/Users/me/project");
     assert!(results[0].snippet.contains("webhook"));
     assert!(results[0].score < 0.0);
+}
+
+#[test]
+fn search_trace_reports_query_terms_and_fts_query() {
+    let store = Store::open(temp_db_path("search-trace")).unwrap();
+    store.index_session(&sample_session()).unwrap();
+
+    let (trace, results) = store
+        .search_with_trace(SearchOptions::new("webhook secret", 5))
+        .unwrap();
+
+    assert_eq!(trace.match_strategy, MatchStrategy::AllTerms);
+    assert_eq!(trace.query_terms, vec!["webhook", "secret"]);
+    assert_eq!(trace.fts_query, "\"webhook\" AND \"secret\"");
+    assert!(trace.fetch_limit >= 200);
+    assert_eq!(results[0].session_id, "session-1");
+}
+
+#[test]
+fn delta_feed_uses_monotonic_change_ids() {
+    let store = Store::open(temp_db_path("delta-feed")).unwrap();
+    store
+        .index_session(&memory_session_with(
+            "session-1",
+            "/Users/me/project",
+            "2026-04-13T01:00:00Z",
+            "/tmp/delta-1.jsonl",
+        ))
+        .unwrap();
+
+    let first = store.delta_items(None, 10, None).unwrap();
+    assert!(matches!(first.first(), Some(DeltaItem::Session { .. })));
+    assert!(first
+        .iter()
+        .any(|item| matches!(item, DeltaItem::Memory { .. })));
+    let first_cursor = encode_delta_cursor(first.last().unwrap());
+    assert!(first_cursor.starts_with("chg_"));
+    let last_change_id = first.last().unwrap().change_id();
+
+    store
+        .index_session(&memory_session_with(
+            "session-2",
+            "/Users/me/project",
+            "2026-04-13T02:00:00Z",
+            "/tmp/delta-2.jsonl",
+        ))
+        .unwrap();
+
+    let second = store.delta_items(Some(&first_cursor), 10, None).unwrap();
+    assert!(!second.is_empty());
+    assert!(second.iter().all(|item| item.change_id() > last_change_id));
+    assert!(second.iter().any(|item| matches!(
+        item,
+        DeltaItem::Session { session_id, .. } if session_id == "session-2"
+    )));
 }
 
 #[test]
@@ -442,4 +522,64 @@ fn search_accepts_punctuation_without_exposing_fts_syntax() {
 
     assert_eq!(results.len(), 1);
     assert_eq!(results[0].source_line_number, 3);
+}
+
+#[test]
+fn extracts_and_consolidates_memory_objects_with_evidence() {
+    let store = Store::open(temp_db_path("memory-consolidation")).unwrap();
+    let mut first = sample_session_with(
+        "memory-1",
+        "/Users/me/projects/codex-recall",
+        "2026-04-13T01:00:00Z",
+        "/tmp/memory-1.jsonl",
+    );
+    first.events = vec![ParsedEvent {
+        session_id: "memory-1".to_owned(),
+        kind: EventKind::AssistantMessage,
+        role: Some("assistant".to_owned()),
+        text: "Decision: Keep MCP resources JSON-only.".to_owned(),
+        command: None,
+        cwd: None,
+        exit_code: None,
+        source_timestamp: Some("2026-04-13T01:00:01Z".to_owned()),
+        source_file_path: PathBuf::from("/tmp/memory-1.jsonl"),
+        source_line_number: 2,
+    }];
+    let mut second = sample_session_with(
+        "memory-2",
+        "/Users/me/projects/codex-recall",
+        "2026-04-13T02:00:00Z",
+        "/tmp/memory-2.jsonl",
+    );
+    second.events = vec![ParsedEvent {
+        session_id: "memory-2".to_owned(),
+        kind: EventKind::AssistantMessage,
+        role: Some("assistant".to_owned()),
+        text: "Decision: Keep MCP resources JSON-only.".to_owned(),
+        command: None,
+        cwd: None,
+        exit_code: None,
+        source_timestamp: Some("2026-04-13T02:00:01Z".to_owned()),
+        source_file_path: PathBuf::from("/tmp/memory-2.jsonl"),
+        source_line_number: 2,
+    }];
+
+    store.index_session(&first).unwrap();
+    store.index_session(&second).unwrap();
+
+    let memories = store
+        .memory_results(MemorySearchOptions {
+            query: Some("MCP resources".to_owned()),
+            limit: 10,
+            ..MemorySearchOptions::default()
+        })
+        .unwrap();
+    assert_eq!(memories.len(), 1);
+    assert_eq!(memories[0].object.kind, MemoryKind::Decision);
+    assert_eq!(memories[0].object.evidence_count, 2);
+
+    let evidence = store.memory_evidence(&memories[0].object.id, 10).unwrap();
+    assert_eq!(evidence.len(), 2);
+    assert_eq!(evidence[0].session_id, "memory-2");
+    assert_eq!(evidence[1].session_id, "memory-1");
 }

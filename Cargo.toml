@@ -1,6 +1,6 @@
 [package]
 name = "codex-recall"
-version = "0.1.2"
+version = "0.1.3"
 edition = "2021"
 description = "Local search and recall for Codex session JSONL archives"
 license = "MIT"

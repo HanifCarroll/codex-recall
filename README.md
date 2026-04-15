@@ -34,6 +34,8 @@ Index your local Codex archives, then query them:
 ```bash
 codex-recall index
 codex-recall search "payment webhook"
+codex-recall memories "launch agent"
+codex-recall delta --json
 codex-recall recent --since 7d
 codex-recall doctor --json
 ```
@@ -83,6 +85,27 @@ Doctor gives a fast health check for the index:
     "source_files": 1
   },
   "freshness": "fresh"
+}
+```
+
+Memories give agents durable objects with receipts instead of raw transcript blobs:
+
+```json
+{
+  "object": "list",
+  "type": "memory",
+  "count": 1,
+  "match_strategy": "all_terms",
+  "results": [
+    {
+      "object": "memory",
+      "id": "mem_decision_1d5e8b7c5bb0e851",
+      "kind": "decision",
+      "summary": "Keep the watcher LaunchAgent generic.",
+      "evidence_count": 2,
+      "resource_uri": "codex-recall://memory/mem_decision_1d5e8b7c5bb0e851"
+    }
+  ]
 }
 ```
 
@@ -144,12 +167,21 @@ codex-recall search "payment webhook" --since 7d
 codex-recall search "payment webhook" --cwd projects/acme-api
 codex-recall search "payment webhook" --exclude-session <session-id-or-session-key>
 codex-recall search "payment webhook" --exclude-current
+codex-recall search "payment webhook" --trace --json
 codex-recall search "payment webhook" --json
 codex-recall recent --repo acme-api --since 7d
 codex-recall recent --day 2026-04-13 --json
 codex-recall day 2026-04-13 --json
 codex-recall bundle "payment webhook" --repo acme-api --since 14d
 codex-recall show <session-id-or-session-key> --json
+codex-recall memories "launch agent" --kind decision --json
+codex-recall memory-show <memory-id> --json
+codex-recall delta --cursor <opaque-cursor> --json
+codex-recall related <session-id-or-session-key> --json
+codex-recall related <memory-id> --json
+codex-recall eval evals/recall.json --json
+codex-recall resources --kind memory --json
+codex-recall read-resource codex-recall://memory/<memory-id>
 codex-recall pin <session-key> --label "watcher design"
 codex-recall pins --repo codex-recall
 codex-recall pins --repo codex-recall --json
@@ -171,6 +203,8 @@ codex-recall search "source-map" --include-duplicates
 codex-recall search "source-map" --kind command
 codex-recall recent --limit 10
 codex-recall recent --json
+codex-recall memories --limit 10 --trace --json
+codex-recall resources --limit 10 --json
 codex-recall show <session-key> --limit 20
 codex-recall pin <session-key> --label "canonical decision" --pins /tmp/pins.json
 codex-recall unpin <session-key> --pins /tmp/pins.json
@@ -179,6 +213,8 @@ codex-recall unpin <session-key> --pins /tmp/pins.json
 ## Behavior
 
 - Streams JSONL files and indexes high-signal user, assistant, and command events.
+- Extracts deterministic memory objects during indexing for `decision`, `task`, `fact`, `open_question`, and `blocker` cues.
+- Consolidates repeated memory statements across sessions into stable `mem_<kind>_<hash>` ids with evidence receipts.
 - Redacts common secret shapes before writing searchable text to SQLite.
 - Skips Codex instruction preambles such as `AGENTS.md` and environment context blocks.
 - Deduplicates exact duplicate transcript events.
@@ -205,10 +241,17 @@ codex-recall unpin <session-key> --pins /tmp/pins.json
 - Can write a macOS LaunchAgent plist for the watcher with `watch --install-launch-agent`.
 - Can bootstrap and verify that LaunchAgent immediately with `watch --install-launch-agent --start-launch-agent`.
 - Groups text search output by session, with the best receipts under each session.
+- Exposes `search --trace --json` so agents can inspect match strategy, repo boost, per-session hit counts, and FTS scores.
+- Exposes `search --trace --json` so agents can inspect the normalized query terms, concrete FTS query, fetch window, repo boost, duplicate identity, per-session hit counts, source priority, and FTS scores.
 - Lists recent sessions without a query when you know the timeframe or repo but not the exact words to search.
 - Prints machine-readable `recent --json`, `show --json`, and `day --json` output for automation.
+- Prints machine-readable `memories`, `memory-show`, `delta`, `related`, `eval`, `resources`, and `read-resource` output for automation.
+- Accepts fixture-driven `eval` cases for `search`, `memories`, and `delta`, so agent retrieval regressions can be checked in CI.
 - Prints a day inventory with `day YYYY-MM-DD --json`, including session records plus repo and cwd counts.
 - Formats search results into an agent-ready context bundle with top sessions, receipts, and follow-up `show` commands.
+- Returns incremental session and memory feeds through `delta`, with append-only `chg_<id>` cursors for deterministic “what changed since I last looked?” polling.
+- Expands related context from a session or memory reference using shared memory evidence instead of a second manual search.
+- Lists and reads MCP-style `codex-recall://session/...` and `codex-recall://memory/...` resources so an external MCP server can wrap the CLI without redesigning its data model.
 - Stores durable labeled pins outside the disposable SQLite index.
 - Ranks sessions by current-repo match, hit count, event kind, FTS rank, and recency.
 - Reports source-file counts and duplicate source-file counts in `stats`.

@@ -3,7 +3,7 @@ use crate::commands::exclude::resolve_excluded_sessions;
 use crate::commands::kind::{event_kinds, KindArg};
 use crate::config::default_db_path;
 use crate::output::{compact_whitespace, now_timestamp, preview, shell_quote};
-use crate::store::{SearchOptions, SearchResult, Store};
+use crate::store::{source_priority_for_path, SearchOptions, SearchResult, SearchTrace, Store};
 use anyhow::{bail, Result};
 use clap::Args;
 use serde_json::json;
@@ -49,6 +49,8 @@ pub struct SearchArgs {
     pub exclude_current: bool,
     #[arg(long, help = "Emit machine-readable JSON")]
     pub json: bool,
+    #[arg(long, help = "Include retrieval trace fields in JSON output")]
+    pub trace: bool,
 }
 
 #[derive(Debug, Clone, Args)]
@@ -126,7 +128,7 @@ pub fn run_search(args: SearchArgs) -> Result<()> {
     } else {
         args.limit.saturating_mul(5)
     };
-    let results = store.search_with_options(SearchOptions {
+    let (trace, results) = store.search_with_trace(SearchOptions {
         query: args.query.clone(),
         limit: search_limit,
         repo: args.repo,
@@ -140,7 +142,7 @@ pub fn run_search(args: SearchArgs) -> Result<()> {
         current_repo,
     })?;
     if args.json {
-        print_search_json(&args.query, &results)?;
+        print_search_json(&args.query, &results, &trace, args.trace)?;
         return Ok(());
     }
 
@@ -455,7 +457,12 @@ fn print_show_json(
     Ok(())
 }
 
-fn print_search_json(query: &str, results: &[SearchResult]) -> Result<()> {
+fn print_search_json(
+    query: &str,
+    results: &[SearchResult],
+    trace: &SearchTrace,
+    include_trace: bool,
+) -> Result<()> {
     let results = results
         .iter()
         .map(|result| {
@@ -464,7 +471,7 @@ fn print_search_json(query: &str, results: &[SearchResult]) -> Result<()> {
                 result.source_file_path.display(),
                 result.source_line_number
             );
-            json!({
+            let mut value = json!({
                 "session_key": result.session_key,
                 "session_id": result.session_id,
                 "repo": result.repo,
@@ -478,15 +485,38 @@ fn print_search_json(query: &str, results: &[SearchResult]) -> Result<()> {
                 "score": result.score,
                 "snippet": compact_whitespace(&result.snippet),
                 "text_preview": preview(&result.text, 500),
-            })
+            });
+            if include_trace {
+                value["trace"] = json!({
+                    "match_strategy": trace.match_strategy.as_str(),
+                    "repo_matches_current": result.repo_matches_current,
+                    "session_hit_count": result.session_hit_count,
+                    "best_kind_weight": result.best_kind_weight,
+                    "fts_score": result.score,
+                    "source_priority": source_priority_for_path(&result.source_file_path),
+                    "duplicate_session_id": result.session_id.as_str(),
+                });
+            }
+            value
         })
         .collect::<Vec<_>>();
 
-    let value = json!({
+    let mut value = json!({
         "query": query,
+        "match_strategy": trace.match_strategy.as_str(),
         "count": results.len(),
         "results": results,
     });
+    if include_trace {
+        value["trace"] = json!({
+            "match_strategy": trace.match_strategy.as_str(),
+            "query_terms": &trace.query_terms,
+            "fts_query": trace.fts_query.as_str(),
+            "fetch_limit": trace.fetch_limit,
+            "current_repo": &trace.current_repo,
+            "include_duplicates": trace.include_duplicates,
+        });
+    }
     println!("{}", serde_json::to_string_pretty(&value)?);
     Ok(())
 }

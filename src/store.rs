@@ -1,3 +1,4 @@
+use crate::memory::{extract_memories, ExtractedMemory, MemoryKind};
 use crate::parser::{EventKind, ParsedSession};
 use anyhow::{bail, Context, Result};
 use rusqlite::{params, params_from_iter, Connection, OpenFlags};
@@ -5,7 +6,7 @@ use std::collections::{hash_map::Entry, BTreeSet, HashMap};
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 
-const CONTENT_VERSION: i64 = 2;
+const CONTENT_VERSION: i64 = 3;
 
 pub struct Store {
     conn: Connection,
@@ -33,7 +34,9 @@ pub struct SearchResult {
     pub source_file_path: PathBuf,
     pub source_line_number: usize,
     pub source_timestamp: Option<String>,
-    repo_matches_current: bool,
+    pub session_hit_count: usize,
+    pub best_kind_weight: u8,
+    pub repo_matches_current: bool,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -49,6 +52,165 @@ pub struct SearchOptions {
     pub exclude_sessions: Vec<String>,
     pub kinds: Vec<EventKind>,
     pub current_repo: Option<String>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum MatchStrategy {
+    AllTerms,
+    AnyTermFallback,
+}
+
+impl MatchStrategy {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            MatchStrategy::AllTerms => "all_terms",
+            MatchStrategy::AnyTermFallback => "any_terms_fallback",
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SearchTrace {
+    pub match_strategy: MatchStrategy,
+    pub query_terms: Vec<String>,
+    pub fts_query: String,
+    pub fetch_limit: usize,
+    pub current_repo: Option<String>,
+    pub include_duplicates: bool,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct MemoryObject {
+    pub id: String,
+    pub kind: MemoryKind,
+    pub summary: String,
+    pub normalized_text: String,
+    pub first_seen_at: String,
+    pub last_seen_at: String,
+    pub created_at: String,
+    pub updated_at: String,
+    pub evidence_count: usize,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct MemoryEvidence {
+    pub memory_id: String,
+    pub session_key: String,
+    pub session_id: String,
+    pub repo: String,
+    pub cwd: String,
+    pub session_timestamp: String,
+    pub source_file_path: PathBuf,
+    pub source_line_number: usize,
+    pub source_timestamp: Option<String>,
+    pub event_kind: EventKind,
+    pub evidence_text: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct MemorySearchOptions {
+    pub query: Option<String>,
+    pub limit: usize,
+    pub repo: Option<String>,
+    pub cwd: Option<String>,
+    pub since: Option<String>,
+    pub from: Option<String>,
+    pub until: Option<String>,
+    pub kinds: Vec<MemoryKind>,
+}
+
+impl Default for MemorySearchOptions {
+    fn default() -> Self {
+        Self {
+            query: None,
+            limit: 20,
+            repo: None,
+            cwd: None,
+            since: None,
+            from: None,
+            until: None,
+            kinds: Vec::new(),
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct MemoryResult {
+    pub object: MemoryObject,
+    pub repos: Vec<String>,
+    pub session_keys: Vec<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum DeltaItem {
+    Session {
+        change_id: i64,
+        action: String,
+        session_key: String,
+        session_id: String,
+        repo: String,
+        cwd: String,
+        session_timestamp: String,
+        updated_at: String,
+    },
+    Memory {
+        change_id: i64,
+        action: String,
+        object: MemoryObject,
+        repos: Vec<String>,
+        session_keys: Vec<String>,
+    },
+    Deleted {
+        change_id: i64,
+        object_type: String,
+        object_id: String,
+        action: String,
+        updated_at: String,
+    },
+}
+
+impl DeltaItem {
+    pub fn updated_at(&self) -> &str {
+        match self {
+            DeltaItem::Session { updated_at, .. } => updated_at,
+            DeltaItem::Memory { object, .. } => &object.updated_at,
+            DeltaItem::Deleted { updated_at, .. } => updated_at,
+        }
+    }
+
+    pub fn change_id(&self) -> i64 {
+        match self {
+            DeltaItem::Session { change_id, .. } => *change_id,
+            DeltaItem::Memory { change_id, .. } => *change_id,
+            DeltaItem::Deleted { change_id, .. } => *change_id,
+        }
+    }
+
+    pub fn change_kind(&self) -> &str {
+        match self {
+            DeltaItem::Session { .. } => "session",
+            DeltaItem::Memory { .. } => "memory",
+            DeltaItem::Deleted { object_type, .. } => object_type,
+        }
+    }
+
+    pub fn action(&self) -> &str {
+        match self {
+            DeltaItem::Session { action, .. } => action,
+            DeltaItem::Memory { action, .. } => action,
+            DeltaItem::Deleted { action, .. } => action,
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ResourceRecord {
+    pub uri: String,
+    pub name: String,
+    pub description: String,
+    pub mime_type: String,
+    pub object_type: String,
+    pub updated_at: String,
 }
 
 impl SearchOptions {
@@ -247,29 +409,68 @@ impl Store {
     }
 
     pub fn search_with_options(&self, options: SearchOptions) -> Result<Vec<SearchResult>> {
+        self.search_with_trace(options).map(|(_, results)| results)
+    }
+
+    pub fn search_with_trace(
+        &self,
+        options: SearchOptions,
+    ) -> Result<(SearchTrace, Vec<SearchResult>)> {
         let terms = fts_terms(&options.query);
         if terms.is_empty() {
-            return Ok(Vec::new());
+            return Ok((
+                SearchTrace {
+                    match_strategy: MatchStrategy::AllTerms,
+                    query_terms: Vec::new(),
+                    fts_query: String::new(),
+                    fetch_limit: 0,
+                    current_repo: options.current_repo.clone(),
+                    include_duplicates: options.include_duplicates,
+                },
+                Vec::new(),
+            ));
         }
 
         let limit = options.limit.clamp(1, 100);
         let fetch_limit = limit.saturating_mul(50).clamp(200, 1_000);
-        let results = self.search_with_fts_query(&options, &and_fts_query(&terms), fetch_limit)?;
+        let all_terms_query = and_fts_query(&terms);
+        let results = self.search_with_fts_query(&options, &all_terms_query, fetch_limit)?;
         if !results.is_empty() || terms.len() == 1 {
-            return Ok(rank_search_results(
+            return Ok((
+                SearchTrace {
+                    match_strategy: MatchStrategy::AllTerms,
+                    query_terms: terms,
+                    fts_query: all_terms_query,
+                    fetch_limit,
+                    current_repo: options.current_repo.clone(),
+                    include_duplicates: options.include_duplicates,
+                },
+                rank_search_results(
+                    results,
+                    options.current_repo.as_deref(),
+                    limit,
+                    options.include_duplicates,
+                ),
+            ));
+        }
+
+        let any_terms_query = or_fts_query(&terms);
+        let results = self.search_with_fts_query(&options, &any_terms_query, fetch_limit)?;
+        Ok((
+            SearchTrace {
+                match_strategy: MatchStrategy::AnyTermFallback,
+                query_terms: terms,
+                fts_query: any_terms_query,
+                fetch_limit,
+                current_repo: options.current_repo.clone(),
+                include_duplicates: options.include_duplicates,
+            },
+            rank_search_results(
                 results,
                 options.current_repo.as_deref(),
                 limit,
                 options.include_duplicates,
-            ));
-        }
-
-        let results = self.search_with_fts_query(&options, &or_fts_query(&terms), fetch_limit)?;
-        Ok(rank_search_results(
-            results,
-            options.current_repo.as_deref(),
-            limit,
-            options.include_duplicates,
+            ),
         ))
     }
 
@@ -383,6 +584,8 @@ impl Store {
                 source_file_path: PathBuf::from(source_file_path),
                 source_line_number: source_line_number as usize,
                 source_timestamp: row.get(11)?,
+                session_hit_count: 0,
+                best_kind_weight: 0,
                 repo_matches_current: row.get::<_, i64>(12)? != 0,
             })
         })?;
@@ -585,6 +788,684 @@ impl Store {
             .map_err(Into::into)
     }
 
+    pub fn memory_results_with_trace(
+        &self,
+        options: MemorySearchOptions,
+    ) -> Result<(MatchStrategy, Vec<MemoryResult>)> {
+        let limit = options.limit.clamp(1, 100);
+        let Some(query) = options
+            .query
+            .as_ref()
+            .map(|value| value.trim())
+            .filter(|value| !value.is_empty())
+        else {
+            let ids = self.list_memory_ids(&options, limit)?;
+            return Ok((MatchStrategy::AllTerms, self.load_memory_results(&ids)?));
+        };
+
+        let terms = fts_terms(query);
+        if terms.is_empty() {
+            return Ok((MatchStrategy::AllTerms, Vec::new()));
+        }
+
+        let ids = self.search_memory_ids_with_fts(&options, &and_fts_query(&terms), limit)?;
+        if !ids.is_empty() || terms.len() == 1 {
+            return Ok((MatchStrategy::AllTerms, self.load_memory_results(&ids)?));
+        }
+
+        let ids = self.search_memory_ids_with_fts(&options, &or_fts_query(&terms), limit)?;
+        Ok((
+            MatchStrategy::AnyTermFallback,
+            self.load_memory_results(&ids)?,
+        ))
+    }
+
+    pub fn memory_results(&self, options: MemorySearchOptions) -> Result<Vec<MemoryResult>> {
+        self.memory_results_with_trace(options)
+            .map(|(_, results)| results)
+    }
+
+    pub fn memory_by_id(&self, memory_id: &str) -> Result<Option<MemoryObject>> {
+        let mut statement = self.conn.prepare(
+            r#"
+            SELECT id, kind, summary, normalized_text, first_seen_at, last_seen_at, created_at, updated_at
+            FROM memory_objects
+            WHERE id = ?
+            "#,
+        )?;
+        let mut rows = statement.query(params![memory_id])?;
+        let Some(row) = rows.next()? else {
+            return Ok(None);
+        };
+        let kind_text: String = row.get(1)?;
+        let kind = MemoryKind::parse(&kind_text)
+            .ok_or_else(|| anyhow::anyhow!("unknown memory kind `{kind_text}`"))?;
+        let evidence_count: i64 = self.conn.query_row(
+            "SELECT COUNT(*) FROM memory_evidence WHERE memory_id = ?",
+            params![memory_id],
+            |count_row| count_row.get(0),
+        )?;
+
+        Ok(Some(MemoryObject {
+            id: row.get(0)?,
+            kind,
+            summary: row.get(2)?,
+            normalized_text: row.get(3)?,
+            first_seen_at: row.get(4)?,
+            last_seen_at: row.get(5)?,
+            created_at: row.get(6)?,
+            updated_at: row.get(7)?,
+            evidence_count: evidence_count as usize,
+        }))
+    }
+
+    pub fn memory_evidence(&self, memory_id: &str, limit: usize) -> Result<Vec<MemoryEvidence>> {
+        let limit = limit.clamp(1, 200);
+        let mut statement = self.conn.prepare(
+            r#"
+            SELECT
+                memory_evidence.memory_id,
+                memory_evidence.session_key,
+                memory_evidence.session_id,
+                sessions.repo,
+                sessions.cwd,
+                sessions.session_timestamp,
+                memory_evidence.source_file_path,
+                memory_evidence.source_line_number,
+                memory_evidence.source_timestamp,
+                memory_evidence.event_kind,
+                memory_evidence.evidence_text
+            FROM memory_evidence
+            JOIN sessions ON sessions.session_key = memory_evidence.session_key
+            WHERE memory_evidence.memory_id = ?
+            ORDER BY datetime(replace(replace(sessions.session_timestamp, 'T', ' '), 'Z', '')) DESC,
+                     memory_evidence.source_line_number ASC
+            LIMIT ?
+            "#,
+        )?;
+        let rows = statement.query_map(params![memory_id, limit.to_string()], |row| {
+            let event_kind_text: String = row.get(9)?;
+            let event_kind = event_kind_text.parse::<EventKind>().map_err(|_| {
+                rusqlite::Error::InvalidColumnType(
+                    9,
+                    "event_kind".to_owned(),
+                    rusqlite::types::Type::Text,
+                )
+            })?;
+            let source_file_path: String = row.get(6)?;
+            let source_line_number: i64 = row.get(7)?;
+            Ok(MemoryEvidence {
+                memory_id: row.get(0)?,
+                session_key: row.get(1)?,
+                session_id: row.get(2)?,
+                repo: row.get(3)?,
+                cwd: row.get(4)?,
+                session_timestamp: row.get(5)?,
+                source_file_path: PathBuf::from(source_file_path),
+                source_line_number: source_line_number as usize,
+                source_timestamp: row.get(8)?,
+                event_kind,
+                evidence_text: row.get(10)?,
+            })
+        })?;
+
+        rows.collect::<std::result::Result<Vec<_>, _>>()
+            .map_err(Into::into)
+    }
+
+    pub fn delta_items(
+        &self,
+        cursor: Option<&str>,
+        limit: usize,
+        repo: Option<&str>,
+    ) -> Result<Vec<DeltaItem>> {
+        if !self.table_exists("change_log")? {
+            return Ok(Vec::new());
+        }
+
+        let limit = limit.clamp(1, 200);
+        let mut next_change_id = cursor
+            .and_then(parse_delta_cursor)
+            .map_or(0, |item| item.change_id);
+        let mut items = Vec::new();
+        let batch_size = limit.saturating_mul(5).clamp(100, 500);
+
+        while items.len() < limit {
+            let rows = self.next_change_rows(next_change_id, batch_size)?;
+            if rows.is_empty() {
+                break;
+            }
+            next_change_id = rows.last().map(|row| row.seq).unwrap_or(next_change_id);
+            for row in rows {
+                if let Some(item) = self.resolve_delta_item(&row, repo)? {
+                    items.push(item);
+                    if items.len() == limit {
+                        break;
+                    }
+                }
+            }
+        }
+
+        Ok(items)
+    }
+
+    pub fn related_memories_for_session(
+        &self,
+        session_key: &str,
+        limit: usize,
+    ) -> Result<Vec<MemoryResult>> {
+        let mut statement = self.conn.prepare(
+            r#"
+            SELECT memory_id
+            FROM memory_evidence
+            WHERE session_key = ?
+            GROUP BY memory_id
+            ORDER BY COUNT(*) DESC, memory_id ASC
+            LIMIT ?
+            "#,
+        )?;
+        let rows = statement.query_map(params![session_key, limit.to_string()], |row| {
+            row.get::<_, String>(0)
+        })?;
+        let ids = rows.collect::<std::result::Result<Vec<_>, _>>()?;
+        self.load_memory_results(&ids)
+    }
+
+    pub fn related_sessions_for_session(
+        &self,
+        session_key: &str,
+        limit: usize,
+    ) -> Result<Vec<RecentSession>> {
+        let mut statement = self.conn.prepare(
+            r#"
+            SELECT
+                sessions.session_key,
+                sessions.session_id,
+                sessions.repo,
+                sessions.cwd,
+                sessions.session_timestamp,
+                sessions.source_file_path
+            FROM memory_evidence seed
+            JOIN memory_evidence related ON related.memory_id = seed.memory_id
+            JOIN sessions ON sessions.session_key = related.session_key
+            WHERE seed.session_key = ?
+              AND related.session_key != ?
+            GROUP BY sessions.session_key
+            ORDER BY COUNT(DISTINCT related.memory_id) DESC,
+                     datetime(replace(replace(sessions.session_timestamp, 'T', ' '), 'Z', '')) DESC,
+                     sessions.session_key ASC
+            LIMIT ?
+            "#,
+        )?;
+        let rows = statement.query_map(
+            params![session_key, session_key, limit.to_string()],
+            |row| {
+                let source_file_path: String = row.get(5)?;
+                Ok(RecentSession {
+                    session_key: row.get(0)?,
+                    session_id: row.get(1)?,
+                    repo: row.get(2)?,
+                    cwd: row.get(3)?,
+                    session_timestamp: row.get(4)?,
+                    source_file_path: PathBuf::from(source_file_path),
+                })
+            },
+        )?;
+        rows.collect::<std::result::Result<Vec<_>, _>>()
+            .map_err(Into::into)
+    }
+
+    pub fn related_sessions_for_memory(
+        &self,
+        memory_id: &str,
+        limit: usize,
+    ) -> Result<Vec<RecentSession>> {
+        let mut statement = self.conn.prepare(
+            r#"
+            SELECT
+                sessions.session_key,
+                sessions.session_id,
+                sessions.repo,
+                sessions.cwd,
+                sessions.session_timestamp,
+                sessions.source_file_path
+            FROM memory_evidence
+            JOIN sessions ON sessions.session_key = memory_evidence.session_key
+            WHERE memory_evidence.memory_id = ?
+            GROUP BY sessions.session_key
+            ORDER BY datetime(replace(replace(sessions.session_timestamp, 'T', ' '), 'Z', '')) DESC,
+                     sessions.session_key ASC
+            LIMIT ?
+            "#,
+        )?;
+        let rows = statement.query_map(params![memory_id, limit.to_string()], |row| {
+            let source_file_path: String = row.get(5)?;
+            Ok(RecentSession {
+                session_key: row.get(0)?,
+                session_id: row.get(1)?,
+                repo: row.get(2)?,
+                cwd: row.get(3)?,
+                session_timestamp: row.get(4)?,
+                source_file_path: PathBuf::from(source_file_path),
+            })
+        })?;
+        rows.collect::<std::result::Result<Vec<_>, _>>()
+            .map_err(Into::into)
+    }
+
+    pub fn cooccurring_memories(&self, memory_id: &str, limit: usize) -> Result<Vec<MemoryResult>> {
+        let mut statement = self.conn.prepare(
+            r#"
+            SELECT related.memory_id
+            FROM memory_evidence seed
+            JOIN memory_evidence related ON related.session_key = seed.session_key
+            WHERE seed.memory_id = ?
+              AND related.memory_id != ?
+            GROUP BY related.memory_id
+            ORDER BY COUNT(DISTINCT related.session_key) DESC, related.memory_id ASC
+            LIMIT ?
+            "#,
+        )?;
+        let rows = statement
+            .query_map(params![memory_id, memory_id, limit.to_string()], |row| {
+                row.get::<_, String>(0)
+            })?;
+        let ids = rows.collect::<std::result::Result<Vec<_>, _>>()?;
+        self.load_memory_results(&ids)
+    }
+
+    pub fn session_resources(&self, limit: usize) -> Result<Vec<ResourceRecord>> {
+        let sessions = self.recent_sessions(RecentOptions {
+            limit,
+            ..RecentOptions::default()
+        })?;
+        Ok(sessions
+            .into_iter()
+            .map(|session| ResourceRecord {
+                uri: format!("codex-recall://session/{}", session.session_key),
+                name: format!("session {}", session.session_id),
+                description: format!("{} {}", session.repo, session.cwd),
+                mime_type: "application/json".to_owned(),
+                object_type: "session".to_owned(),
+                updated_at: session.session_timestamp,
+            })
+            .collect())
+    }
+
+    pub fn memory_resources(&self, limit: usize) -> Result<Vec<ResourceRecord>> {
+        let memories = self.memory_results(MemorySearchOptions {
+            limit,
+            ..MemorySearchOptions::default()
+        })?;
+        Ok(memories
+            .into_iter()
+            .map(|memory| ResourceRecord {
+                uri: format!("codex-recall://memory/{}", memory.object.id),
+                name: format!("{} {}", memory.object.kind.as_str(), memory.object.id),
+                description: memory.object.summary,
+                mime_type: "application/json".to_owned(),
+                object_type: "memory".to_owned(),
+                updated_at: memory.object.updated_at,
+            })
+            .collect())
+    }
+
+    fn list_memory_ids(&self, options: &MemorySearchOptions, limit: usize) -> Result<Vec<String>> {
+        let mut sql = "SELECT memory_objects.id FROM memory_objects WHERE 1 = 1".to_owned();
+        let mut params = Vec::<String>::new();
+        append_memory_filter_clauses(&mut sql, &mut params, options)?;
+        sql.push_str(
+            r#"
+            ORDER BY datetime(replace(replace(memory_objects.last_seen_at, 'T', ' '), 'Z', '')) DESC,
+                     memory_objects.id ASC
+            LIMIT ?
+            "#,
+        );
+        params.push(limit.to_string());
+        let mut statement = self.conn.prepare(&sql)?;
+        let rows = statement.query_map(params_from_iter(params.iter()), |row| {
+            row.get::<_, String>(0)
+        })?;
+        rows.collect::<std::result::Result<Vec<_>, _>>()
+            .map_err(Into::into)
+    }
+
+    fn search_memory_ids_with_fts(
+        &self,
+        options: &MemorySearchOptions,
+        fts_query: &str,
+        limit: usize,
+    ) -> Result<Vec<String>> {
+        let fetch_limit = limit.saturating_mul(10).clamp(limit, 500);
+        let mut sql = r#"
+            SELECT memory_objects.id
+            FROM memory_fts
+            JOIN memory_objects ON memory_objects.id = memory_fts.memory_id
+            WHERE memory_fts MATCH ?
+        "#
+        .to_owned();
+        let mut params = vec![fts_query.to_owned()];
+        append_memory_filter_clauses(&mut sql, &mut params, options)?;
+        sql.push_str(
+            r#"
+            ORDER BY memory_fts.rank ASC,
+                     datetime(replace(replace(memory_objects.last_seen_at, 'T', ' '), 'Z', '')) DESC,
+                     memory_objects.id ASC
+            LIMIT ?
+            "#,
+        );
+        params.push(fetch_limit.to_string());
+        let mut statement = self.conn.prepare(&sql)?;
+        let rows = statement.query_map(params_from_iter(params.iter()), |row| {
+            row.get::<_, String>(0)
+        })?;
+        let mut ids = rows.collect::<std::result::Result<Vec<_>, _>>()?;
+        ids.dedup();
+        if ids.len() > limit {
+            ids.truncate(limit);
+        }
+        Ok(ids)
+    }
+
+    fn load_memory_results(&self, ids: &[String]) -> Result<Vec<MemoryResult>> {
+        let mut results = Vec::new();
+        for id in ids {
+            let Some(object) = self.memory_by_id(id)? else {
+                continue;
+            };
+            let repos = self.memory_repos(id)?;
+            let session_keys = self.memory_session_keys(id)?;
+            results.push(MemoryResult {
+                object,
+                repos,
+                session_keys,
+            });
+        }
+        Ok(results)
+    }
+
+    fn memory_repos(&self, memory_id: &str) -> Result<Vec<String>> {
+        let mut statement = self.conn.prepare(
+            r#"
+            SELECT DISTINCT sessions.repo
+            FROM memory_evidence
+            JOIN sessions ON sessions.session_key = memory_evidence.session_key
+            WHERE memory_evidence.memory_id = ?
+              AND sessions.repo != ''
+            ORDER BY lower(sessions.repo) ASC
+            "#,
+        )?;
+        let rows = statement.query_map(params![memory_id], |row| row.get::<_, String>(0))?;
+        rows.collect::<std::result::Result<Vec<_>, _>>()
+            .map_err(Into::into)
+    }
+
+    fn memory_session_keys(&self, memory_id: &str) -> Result<Vec<String>> {
+        let mut statement = self.conn.prepare(
+            r#"
+            SELECT DISTINCT session_key
+            FROM memory_evidence
+            WHERE memory_id = ?
+            ORDER BY session_key ASC
+            "#,
+        )?;
+        let rows = statement.query_map(params![memory_id], |row| row.get::<_, String>(0))?;
+        rows.collect::<std::result::Result<Vec<_>, _>>()
+            .map_err(Into::into)
+    }
+
+    fn memory_ids_for_session(&self, session_key: &str) -> Result<Vec<String>> {
+        let mut statement = self.conn.prepare(
+            r#"
+            SELECT DISTINCT memory_id
+            FROM memory_evidence
+            WHERE session_key = ?
+            ORDER BY memory_id ASC
+            "#,
+        )?;
+        let rows = statement.query_map(params![session_key], |row| row.get::<_, String>(0))?;
+        rows.collect::<std::result::Result<Vec<_>, _>>()
+            .map_err(Into::into)
+    }
+
+    fn upsert_memory_object(
+        &self,
+        memory: &ExtractedMemory,
+        session_timestamp: &str,
+    ) -> Result<()> {
+        self.conn.execute(
+            r#"
+            INSERT INTO memory_objects (
+                id, kind, summary, normalized_text, first_seen_at, last_seen_at, created_at, updated_at
+            ) VALUES (?, ?, ?, ?, ?, ?, strftime('%Y-%m-%dT%H:%M:%fZ','now'), strftime('%Y-%m-%dT%H:%M:%fZ','now'))
+            ON CONFLICT(id) DO UPDATE SET
+                kind = excluded.kind,
+                summary = CASE
+                    WHEN length(excluded.summary) < length(memory_objects.summary) THEN excluded.summary
+                    ELSE memory_objects.summary
+                END,
+                normalized_text = excluded.normalized_text,
+                first_seen_at = MIN(memory_objects.first_seen_at, excluded.first_seen_at),
+                last_seen_at = MAX(memory_objects.last_seen_at, excluded.last_seen_at),
+                updated_at = strftime('%Y-%m-%dT%H:%M:%fZ','now')
+            "#,
+            params![
+                memory.id,
+                memory.kind.as_str(),
+                memory.summary,
+                memory.normalized_text,
+                session_timestamp,
+                session_timestamp,
+            ],
+        )?;
+        Ok(())
+    }
+
+    fn refresh_memory_objects(&self, memory_ids: &[String]) -> Result<()> {
+        for memory_id in memory_ids {
+            let evidence_count: i64 = self.conn.query_row(
+                "SELECT COUNT(*) FROM memory_evidence WHERE memory_id = ?",
+                params![memory_id],
+                |row| row.get(0),
+            )?;
+
+            if evidence_count == 0 {
+                self.conn.execute(
+                    "DELETE FROM memory_fts WHERE memory_id = ?",
+                    params![memory_id],
+                )?;
+                self.conn.execute(
+                    "DELETE FROM memory_objects WHERE id = ?",
+                    params![memory_id],
+                )?;
+                self.record_change("memory", memory_id, "delete")?;
+                continue;
+            }
+
+            let (first_seen_at, last_seen_at, kind, summary, normalized_text): (
+                String,
+                String,
+                String,
+                String,
+                String,
+            ) = self.conn.query_row(
+                r#"
+                SELECT
+                    MIN(sessions.session_timestamp),
+                    MAX(sessions.session_timestamp),
+                    memory_objects.kind,
+                    memory_objects.summary,
+                    memory_objects.normalized_text
+                FROM memory_objects
+                JOIN memory_evidence ON memory_evidence.memory_id = memory_objects.id
+                JOIN sessions ON sessions.session_key = memory_evidence.session_key
+                WHERE memory_objects.id = ?
+                GROUP BY memory_objects.id
+                "#,
+                params![memory_id],
+                |row| {
+                    Ok((
+                        row.get(0)?,
+                        row.get(1)?,
+                        row.get(2)?,
+                        row.get(3)?,
+                        row.get(4)?,
+                    ))
+                },
+            )?;
+
+            self.conn.execute(
+                r#"
+                UPDATE memory_objects
+                SET first_seen_at = ?, last_seen_at = ?, updated_at = strftime('%Y-%m-%dT%H:%M:%fZ','now')
+                WHERE id = ?
+                "#,
+                params![first_seen_at, last_seen_at, memory_id],
+            )?;
+            self.conn.execute(
+                "DELETE FROM memory_fts WHERE memory_id = ?",
+                params![memory_id],
+            )?;
+            self.conn.execute(
+                r#"
+                INSERT INTO memory_fts (memory_id, kind, summary, normalized_text)
+                VALUES (?, ?, ?, ?)
+                "#,
+                params![memory_id, kind, summary, normalized_text],
+            )?;
+            self.record_change("memory", memory_id, "upsert")?;
+        }
+
+        Ok(())
+    }
+
+    fn record_change(&self, object_type: &str, object_id: &str, action: &str) -> Result<i64> {
+        self.conn.execute(
+            r#"
+            INSERT INTO change_log (object_type, object_id, action)
+            VALUES (?, ?, ?)
+            "#,
+            params![object_type, object_id, action],
+        )?;
+        Ok(self.conn.last_insert_rowid())
+    }
+
+    fn next_change_rows(&self, after_change_id: i64, limit: usize) -> Result<Vec<ChangeLogRow>> {
+        let mut statement = self.conn.prepare(
+            r#"
+            SELECT seq, object_type, object_id, action, recorded_at
+            FROM change_log
+            WHERE seq > ?
+            ORDER BY seq ASC
+            LIMIT ?
+            "#,
+        )?;
+        let rows = statement.query_map(params![after_change_id, limit as i64], |row| {
+            Ok(ChangeLogRow {
+                seq: row.get(0)?,
+                object_type: row.get(1)?,
+                object_id: row.get(2)?,
+                action: row.get(3)?,
+                recorded_at: row.get(4)?,
+            })
+        })?;
+
+        rows.collect::<std::result::Result<Vec<_>, _>>()
+            .map_err(Into::into)
+    }
+
+    fn session_has_repo(&self, session_key: &str, repo: &str) -> Result<bool> {
+        let count = self.conn.query_row(
+            r#"
+            SELECT COUNT(*)
+            FROM session_repos
+            WHERE session_key = ?
+              AND lower(repo) = lower(?)
+            "#,
+            params![session_key, repo],
+            |row| row.get::<_, i64>(0),
+        )?;
+        Ok(count > 0)
+    }
+
+    fn memory_result_by_id(&self, memory_id: &str) -> Result<Option<MemoryResult>> {
+        self.load_memory_results(&[memory_id.to_owned()])
+            .map(|results| results.into_iter().next())
+    }
+
+    fn resolve_delta_item(
+        &self,
+        row: &ChangeLogRow,
+        repo: Option<&str>,
+    ) -> Result<Option<DeltaItem>> {
+        match row.object_type.as_str() {
+            "session" => {
+                let mut statement = self.conn.prepare(
+                    r#"
+                    SELECT session_key, session_id, repo, cwd, session_timestamp, indexed_at
+                    FROM sessions
+                    WHERE session_key = ?
+                    "#,
+                )?;
+                let mut rows = statement.query(params![row.object_id.as_str()])?;
+                let Some(session_row) = rows.next()? else {
+                    return Ok(None);
+                };
+                let session_key: String = session_row.get(0)?;
+                if let Some(repo_filter) = repo {
+                    if !self.session_has_repo(&session_key, repo_filter)? {
+                        return Ok(None);
+                    }
+                }
+
+                Ok(Some(DeltaItem::Session {
+                    change_id: row.seq,
+                    action: row.action.clone(),
+                    session_key,
+                    session_id: session_row.get(1)?,
+                    repo: session_row.get(2)?,
+                    cwd: session_row.get(3)?,
+                    session_timestamp: session_row.get(4)?,
+                    updated_at: session_row.get(5)?,
+                }))
+            }
+            "memory" => {
+                if let Some(result) = self.memory_result_by_id(&row.object_id)? {
+                    if let Some(repo_filter) = repo {
+                        if !result
+                            .repos
+                            .iter()
+                            .any(|item| item.eq_ignore_ascii_case(repo_filter))
+                        {
+                            return Ok(None);
+                        }
+                    }
+
+                    return Ok(Some(DeltaItem::Memory {
+                        change_id: row.seq,
+                        action: row.action.clone(),
+                        object: result.object,
+                        repos: result.repos,
+                        session_keys: result.session_keys,
+                    }));
+                }
+
+                if repo.is_some() {
+                    return Ok(None);
+                }
+
+                Ok(Some(DeltaItem::Deleted {
+                    change_id: row.seq,
+                    object_type: row.object_type.clone(),
+                    object_id: row.object_id.clone(),
+                    action: row.action.clone(),
+                    updated_at: row.recorded_at.clone(),
+                }))
+            }
+            _ => Ok(None),
+        }
+    }
+
     pub fn is_source_current(
         &self,
         source_file_path: &Path,
@@ -665,6 +1546,7 @@ impl Store {
         }
 
         self.create_schema_objects()?;
+        self.ensure_sessions_indexed_at_column()?;
         self.ensure_ingestion_state_session_key_column()?;
         self.ensure_ingestion_state_content_version_column()?;
         self.backfill_session_repos()?;
@@ -683,7 +1565,8 @@ impl Store {
                 cwd TEXT NOT NULL,
                 repo TEXT NOT NULL DEFAULT '',
                 cli_version TEXT,
-                source_file_path TEXT NOT NULL
+                source_file_path TEXT NOT NULL,
+                indexed_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ','now'))
             );
 
             CREATE INDEX IF NOT EXISTS sessions_session_id_idx ON sessions(session_id);
@@ -733,9 +1616,61 @@ impl Store {
                 source_file_size INTEGER NOT NULL,
                 session_id TEXT,
                 session_key TEXT,
-                content_version INTEGER NOT NULL DEFAULT 2,
+                content_version INTEGER NOT NULL DEFAULT 3,
                 indexed_at TEXT NOT NULL
             );
+
+            CREATE TABLE IF NOT EXISTS memory_objects (
+                id TEXT PRIMARY KEY,
+                kind TEXT NOT NULL,
+                summary TEXT NOT NULL,
+                normalized_text TEXT NOT NULL,
+                first_seen_at TEXT NOT NULL,
+                last_seen_at TEXT NOT NULL,
+                created_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ','now')),
+                updated_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ','now'))
+            );
+
+            CREATE UNIQUE INDEX IF NOT EXISTS memory_objects_kind_normalized_idx
+                ON memory_objects(kind, normalized_text);
+            CREATE INDEX IF NOT EXISTS memory_objects_updated_idx
+                ON memory_objects(updated_at);
+
+            CREATE TABLE IF NOT EXISTS memory_evidence (
+                memory_id TEXT NOT NULL,
+                session_key TEXT NOT NULL,
+                session_id TEXT NOT NULL,
+                source_file_path TEXT NOT NULL,
+                source_line_number INTEGER NOT NULL,
+                source_timestamp TEXT,
+                event_kind TEXT NOT NULL,
+                evidence_text TEXT NOT NULL,
+                PRIMARY KEY(memory_id, source_file_path, source_line_number),
+                FOREIGN KEY(memory_id) REFERENCES memory_objects(id) ON DELETE CASCADE,
+                FOREIGN KEY(session_key) REFERENCES sessions(session_key) ON DELETE CASCADE
+            );
+
+            CREATE INDEX IF NOT EXISTS memory_evidence_memory_idx ON memory_evidence(memory_id);
+            CREATE INDEX IF NOT EXISTS memory_evidence_session_idx ON memory_evidence(session_key);
+
+            CREATE VIRTUAL TABLE IF NOT EXISTS memory_fts USING fts5(
+                memory_id UNINDEXED,
+                kind UNINDEXED,
+                summary,
+                normalized_text,
+                tokenize = 'porter unicode61'
+            );
+
+            CREATE TABLE IF NOT EXISTS change_log (
+                seq INTEGER PRIMARY KEY AUTOINCREMENT,
+                object_type TEXT NOT NULL,
+                object_id TEXT NOT NULL,
+                action TEXT NOT NULL,
+                recorded_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ','now'))
+            );
+
+            CREATE INDEX IF NOT EXISTS change_log_object_idx
+                ON change_log(object_type, object_id, seq);
             "#,
         )?;
         Ok(())
@@ -747,15 +1682,16 @@ impl Store {
         self.conn.execute(
             r#"
             INSERT INTO sessions (
-                session_key, session_id, session_timestamp, cwd, repo, cli_version, source_file_path
-            ) VALUES (?, ?, ?, ?, ?, ?, ?)
+                session_key, session_id, session_timestamp, cwd, repo, cli_version, source_file_path, indexed_at
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, strftime('%Y-%m-%dT%H:%M:%fZ','now'))
             ON CONFLICT(session_key) DO UPDATE SET
                 session_id = excluded.session_id,
                 session_timestamp = excluded.session_timestamp,
                 cwd = excluded.cwd,
                 repo = excluded.repo,
                 cli_version = excluded.cli_version,
-                source_file_path = excluded.source_file_path
+                source_file_path = excluded.source_file_path,
+                indexed_at = excluded.indexed_at
             "#,
             params![
                 session_key.as_str(),
@@ -767,6 +1703,9 @@ impl Store {
                 parsed.session.source_file_path.display().to_string(),
             ],
         )?;
+        self.record_change("session", &session_key, "upsert")?;
+
+        let mut affected_memory_ids = self.memory_ids_for_session(&session_key)?;
 
         self.conn.execute(
             "DELETE FROM events_fts WHERE session_key = ?",
@@ -778,6 +1717,10 @@ impl Store {
         )?;
         self.conn.execute(
             "DELETE FROM session_repos WHERE session_key = ?",
+            params![session_key.as_str()],
+        )?;
+        self.conn.execute(
+            "DELETE FROM memory_evidence WHERE session_key = ?",
             params![session_key.as_str()],
         )?;
 
@@ -822,6 +1765,33 @@ impl Store {
                 ],
             )?;
         }
+
+        for memory in extract_memories(parsed) {
+            self.upsert_memory_object(&memory, &parsed.session.timestamp)?;
+            self.conn.execute(
+                r#"
+                INSERT OR REPLACE INTO memory_evidence (
+                    memory_id, session_key, session_id, source_file_path, source_line_number,
+                    source_timestamp, event_kind, evidence_text
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+                "#,
+                params![
+                    memory.id,
+                    session_key.as_str(),
+                    parsed.session.id,
+                    parsed.session.source_file_path.display().to_string(),
+                    memory.source_line_number as i64,
+                    memory.source_timestamp,
+                    memory.event_kind.as_str(),
+                    memory.evidence_text,
+                ],
+            )?;
+            affected_memory_ids.push(memory.id);
+        }
+
+        affected_memory_ids.sort();
+        affected_memory_ids.dedup();
+        self.refresh_memory_objects(&affected_memory_ids)?;
 
         Ok(())
     }
@@ -873,6 +1843,27 @@ impl Store {
             [],
         ) {
             Ok(_) => Ok(()),
+            Err(error) if error.to_string().contains("duplicate column name") => Ok(()),
+            Err(error) => Err(error.into()),
+        }
+    }
+
+    fn ensure_sessions_indexed_at_column(&self) -> Result<()> {
+        if self.table_has_column("sessions", "indexed_at")? {
+            return Ok(());
+        }
+
+        match self.conn.execute(
+            "ALTER TABLE sessions ADD COLUMN indexed_at TEXT NOT NULL DEFAULT '1970-01-01T00:00:00.000Z'",
+            [],
+        ) {
+            Ok(_) => {
+                self.conn.execute(
+                    "UPDATE sessions SET indexed_at = strftime('%Y-%m-%dT%H:%M:%fZ','now') WHERE indexed_at = '1970-01-01T00:00:00.000Z'",
+                    [],
+                )?;
+                Ok(())
+            }
             Err(error) if error.to_string().contains("duplicate column name") => Ok(()),
             Err(error) => Err(error.into()),
         }
@@ -987,8 +1978,8 @@ impl Store {
                 self.conn.execute(
                     r#"
                     INSERT INTO sessions (
-                        session_key, session_id, session_timestamp, cwd, repo, cli_version, source_file_path
-                    ) VALUES (?, ?, ?, ?, ?, ?, ?)
+                        session_key, session_id, session_timestamp, cwd, repo, cli_version, source_file_path, indexed_at
+                    ) VALUES (?, ?, ?, ?, ?, ?, ?, strftime('%Y-%m-%dT%H:%M:%fZ','now'))
                     "#,
                     params![
                         session_key,
@@ -1317,10 +2308,113 @@ fn append_recent_event_kind_clause(
     append_kind_params(query_params, kinds);
 }
 
+fn append_memory_filter_clauses(
+    sql: &mut String,
+    query_params: &mut Vec<String>,
+    options: &MemorySearchOptions,
+) -> Result<()> {
+    append_memory_kind_clause(sql, query_params, &options.kinds);
+    if let Some(repo) = &options.repo {
+        sql.push_str(
+            r#"
+            AND EXISTS (
+                SELECT 1
+                FROM memory_evidence
+                JOIN sessions ON sessions.session_key = memory_evidence.session_key
+                WHERE memory_evidence.memory_id = memory_objects.id
+                  AND lower(sessions.repo) = lower(?)
+            )
+            "#,
+        );
+        query_params.push(repo.clone());
+    }
+    if let Some(cwd) = &options.cwd {
+        sql.push_str(
+            r#"
+            AND EXISTS (
+                SELECT 1
+                FROM memory_evidence
+                JOIN sessions ON sessions.session_key = memory_evidence.session_key
+                WHERE memory_evidence.memory_id = memory_objects.id
+                  AND sessions.cwd LIKE '%' || ? || '%'
+            )
+            "#,
+        );
+        query_params.push(cwd.clone());
+    }
+    if options.since.is_some() || options.from.is_some() || options.until.is_some() {
+        let mut time_clause = String::new();
+        let mut time_params = Vec::new();
+        append_from_until_clauses(
+            &mut time_clause,
+            &mut time_params,
+            options.since.as_ref(),
+            options.from.as_ref(),
+            options.until.as_ref(),
+        )?;
+        if !time_clause.is_empty() {
+            let clause = time_clause
+                .replacen(" AND ", "", 1)
+                .replace("sessions.", "related_sessions.");
+            sql.push_str(
+                r#"
+                AND EXISTS (
+                    SELECT 1
+                    FROM memory_evidence
+                    JOIN sessions AS related_sessions ON related_sessions.session_key = memory_evidence.session_key
+                    WHERE memory_evidence.memory_id = memory_objects.id
+                "#,
+            );
+            sql.push_str(" AND ");
+            sql.push_str(&clause);
+            sql.push(')');
+            query_params.extend(time_params);
+        }
+    }
+    Ok(())
+}
+
+fn append_memory_kind_clause(
+    sql: &mut String,
+    query_params: &mut Vec<String>,
+    kinds: &[MemoryKind],
+) {
+    if kinds.is_empty() {
+        return;
+    }
+    sql.push_str(" AND memory_objects.kind IN (");
+    sql.push_str(&placeholders(kinds.len()));
+    sql.push(')');
+    query_params.extend(kinds.iter().map(|kind| kind.as_str().to_owned()));
+}
+
 fn placeholders(count: usize) -> String {
     std::iter::repeat_n("?", count)
         .collect::<Vec<_>>()
         .join(", ")
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct DeltaCursor {
+    change_id: i64,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct ChangeLogRow {
+    seq: i64,
+    object_type: String,
+    object_id: String,
+    action: String,
+    recorded_at: String,
+}
+
+fn parse_delta_cursor(value: &str) -> Option<DeltaCursor> {
+    let change_id = value.strip_prefix("chg_")?.parse::<i64>().ok()?;
+    Some(DeltaCursor { change_id })
+}
+
+pub fn encode_delta_cursor(item: &DeltaItem) -> String {
+    format!("chg_{}", item.change_id())
 }
 
 fn append_kind_params(query_params: &mut Vec<String>, kinds: &[EventKind]) {
@@ -1400,6 +2494,10 @@ fn rank_search_results(
                 .then_with(|| event_kind_weight(left.kind).cmp(&event_kind_weight(right.kind)))
                 .then_with(|| left.source_line_number.cmp(&right.source_line_number))
         });
+        for result in &mut group.results {
+            result.session_hit_count = group.hit_count;
+            result.best_kind_weight = group.best_kind_weight;
+        }
         ranked.extend(group.results);
         if ranked.len() >= limit {
             ranked.truncate(limit);
@@ -1497,6 +2595,10 @@ fn source_priority(path: &Path) -> u8 {
         return 0;
     }
     1
+}
+
+pub fn source_priority_for_path(path: &Path) -> u8 {
+    source_priority(path)
 }
 
 fn event_kind_weight(kind: EventKind) -> u8 {

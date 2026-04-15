@@ -6,6 +6,16 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ## [Unreleased]
 
+## [0.1.3] - 2026-04-15
+
+### Added
+
+- Added deterministic memory extraction during indexing, with stable memory ids plus evidence receipts for decisions, tasks, facts, blockers, and open questions.
+- Added `memories`, `memory-show`, `delta`, `related`, `eval`, `resources`, and `read-resource` commands for agent-facing memory retrieval and MCP-style resource access.
+- Added append-only `chg_<id>` delta cursors so incremental polling is deterministic and independent of timestamp ordering.
+- Expanded `search --trace --json` with normalized query terms, concrete FTS queries, source priority, duplicate identity, and fetch-window details.
+- Expanded the fixture-driven eval harness so `search`, `memories`, and `delta` retrieval regressions can be asserted in CI.
+
 ## [0.1.2] - 2026-04-15
 
 ### Added
