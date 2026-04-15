@@ -6,6 +6,13 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ## [Unreleased]
 
+## [0.1.2] - 2026-04-15
+
+### Added
+
+- Published `codex-recall` to crates.io and documented the registry install path in the README.
+- Added a crates.io badge so the canonical package version is visible from the repo homepage.
+
 ## [0.1.1] - 2026-04-15
 
 ### Fixed

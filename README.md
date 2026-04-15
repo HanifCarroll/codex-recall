@@ -1,6 +1,7 @@
 # codex-recall
 
 [![CI](https://github.com/HanifCarroll/codex-recall/actions/workflows/ci.yml/badge.svg)](https://github.com/HanifCarroll/codex-recall/actions/workflows/ci.yml)
+[![crates.io](https://img.shields.io/crates/v/codex-recall.svg)](https://crates.io/crates/codex-recall)
 
 Local search and recall for Codex session JSONL archives.
 
@@ -11,13 +12,19 @@ Raw JSONL files remain the source of truth.
 ## Install
 
 ```bash
-cargo install --path .
+cargo install codex-recall
 ```
 
 Or install directly from GitHub:
 
 ```bash
 cargo install --git https://github.com/HanifCarroll/codex-recall
+```
+
+Build from source:
+
+```bash
+cargo install --path .
 ```
 
 ## Quick Start
