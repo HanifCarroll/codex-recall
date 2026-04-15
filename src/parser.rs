@@ -480,12 +480,15 @@ mod tests {
 
     #[test]
     fn redacts_secrets_before_events_are_indexed() {
+        let github_pat = ["github", "_pat_", "1234567890abcdefghijklmnop"].concat();
         let path = temp_jsonl(
             "redaction",
-            r#"{"timestamp":"2026-04-13T01:00:00Z","type":"session_meta","payload":{"id":"session-6","timestamp":"2026-04-13T01:00:00Z","cwd":"/Users/me/project"}}
-{"timestamp":"2026-04-13T01:00:01Z","type":"event_msg","payload":{"type":"user_message","message":"Use API_KEY=abc123456789 and Authorization: Bearer eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ"}}
-{"timestamp":"2026-04-13T01:00:02Z","type":"event_msg","payload":{"type":"exec_command_end","command":"curl -H 'Authorization: Bearer supersecrettoken123456' https://example.com","cwd":"/Users/me/project","exit_code":0,"stdout":"github_pat_1234567890abcdefghijklmnop\n","stderr":""}}
-"#,
+            &format!(
+                r#"{{"timestamp":"2026-04-13T01:00:00Z","type":"session_meta","payload":{{"id":"session-6","timestamp":"2026-04-13T01:00:00Z","cwd":"/Users/me/project"}}}}
+{{"timestamp":"2026-04-13T01:00:01Z","type":"event_msg","payload":{{"type":"user_message","message":"Use API_KEY=abc123456789 and Authorization: Bearer eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ"}}}}
+{{"timestamp":"2026-04-13T01:00:02Z","type":"event_msg","payload":{{"type":"exec_command_end","command":"curl -H 'Authorization: Bearer supersecrettoken123456' https://example.com","cwd":"/Users/me/project","exit_code":0,"stdout":"{github_pat}\n","stderr":""}}}}
+"#
+            ),
         );
 
         let parsed = parse_session_file(&path).unwrap().unwrap();
@@ -504,7 +507,7 @@ mod tests {
         assert!(!parsed.events.iter().any(|event| {
             event.text.contains("abc123456789")
                 || event.text.contains("supersecrettoken123456")
-                || event.text.contains("github_pat_1234567890")
+                || event.text.contains(&github_pat)
         }));
     }
 

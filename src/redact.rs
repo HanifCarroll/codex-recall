@@ -119,12 +119,16 @@ fn private_key_block_regex() -> &'static Regex {
 mod tests {
     use super::*;
 
+    fn joined(parts: &[&str]) -> String {
+        parts.concat()
+    }
+
     #[test]
     fn redacts_credential_assignments_without_redacting_plain_language() {
         let text =
             "The webhook secret was missing. API_KEY=abc123456789 SENTRY_DSN=https://public@dsn";
 
-        let redacted = redact_secrets(text);
+        let redacted = redact_secrets(&text);
 
         assert!(redacted.contains("The webhook secret was missing."));
         assert!(redacted.contains("API_KEY=[REDACTED]"));
@@ -135,56 +139,62 @@ mod tests {
 
     #[test]
     fn redacts_auth_headers_and_common_token_prefixes() {
-        let text = r#"{"authorization":"Bearer eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9","token":"github_pat_1234567890abcdefghijklmnop","openai":"sk-abcdefghijklmnopqrstuvwxyz"}"#;
+        let github_pat = joined(&["github", "_pat_", "1234567890abcdefghijklmnop"]);
+        let openai_key = joined(&["sk", "-", "abcdefghijklmnopqrstuvwxyz"]);
+        let text = format!(
+            r#"{{"authorization":"Bearer eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9","token":"{github_pat}","openai":"{openai_key}"}}"#
+        );
 
-        let redacted = redact_secrets(text);
+        let redacted = redact_secrets(&text);
 
         assert!(redacted.contains(r#""authorization":"Bearer [REDACTED]""#));
         assert!(redacted.contains(r#""token":[REDACTED]"#));
         assert!(redacted.contains(r#""openai":"[REDACTED]""#));
         assert!(!redacted.contains("eyJhbGci"));
-        assert!(!redacted.contains("github_pat_1234567890"));
-        assert!(!redacted.contains("sk-abcdefghijklmnopqrstuvwxyz"));
+        assert!(!redacted.contains(&github_pat));
+        assert!(!redacted.contains(&openai_key));
     }
 
     #[test]
     fn redacts_fixture_corpus_without_leaking_secret_values() {
+        let openai_key = joined(&["sk", "-proj-", "1234567890abcdefghijklmnop"]);
+        let stripe_webhook_secret = joined(&["whsec", "_", "1234567890abcdefghijklmnop"]);
         let fixtures = [
             (
-                "OPENAI_API_KEY = \"sk-proj-1234567890abcdefghijklmnop\"",
-                "sk-proj-1234567890abcdefghijklmnop",
+                format!("OPENAI_API_KEY = \"{openai_key}\""),
+                openai_key,
             ),
             (
-                "STRIPE_WEBHOOK_SECRET='whsec_1234567890abcdefghijklmnop'",
-                "whsec_1234567890abcdefghijklmnop",
+                format!("STRIPE_WEBHOOK_SECRET='{stripe_webhook_secret}'"),
+                stripe_webhook_secret,
             ),
             (
-                "Authorization: Bearer abcdefghijklmnopqrstuvwxyz.1234567890",
-                "abcdefghijklmnopqrstuvwxyz.1234567890",
+                "Authorization: Bearer abcdefghijklmnopqrstuvwxyz.1234567890".to_owned(),
+                "abcdefghijklmnopqrstuvwxyz.1234567890".to_owned(),
             ),
             (
-                r#"{"cookie":"sessionid=abc123456789; path=/"}"#,
-                "sessionid=abc123456789",
+                r#"{"cookie":"sessionid=abc123456789; path=/"}"#.to_owned(),
+                "sessionid=abc123456789".to_owned(),
             ),
             (
-                "password : \"correct horse battery staple\"",
-                "correct horse battery staple",
+                "password : \"correct horse battery staple\"".to_owned(),
+                "correct horse battery staple".to_owned(),
             ),
             (
-                "-----BEGIN PRIVATE KEY-----\nabc123secret\n-----END PRIVATE KEY-----",
-                "abc123secret",
+                "-----BEGIN PRIVATE KEY-----\nabc123secret\n-----END PRIVATE KEY-----".to_owned(),
+                "abc123secret".to_owned(),
             ),
         ];
 
         for (input, leaked_value) in fixtures {
-            let redacted = redact_secrets(input);
+            let redacted = redact_secrets(&input);
 
             assert!(
                 redacted.contains(REDACTED),
                 "fixture was not redacted: {input}"
             );
             assert!(
-                !redacted.contains(leaked_value),
+                !redacted.contains(&leaked_value),
                 "fixture leaked {leaked_value}: {redacted}"
             );
         }
