@@ -1,5 +1,7 @@
 # codex-recall
 
+[![CI](https://github.com/HanifCarroll/codex-recall/actions/workflows/ci.yml/badge.svg)](https://github.com/HanifCarroll/codex-recall/actions/workflows/ci.yml)
+
 Local search and recall for Codex session JSONL archives.
 
 `codex-recall` builds a disposable SQLite FTS5 index over transcript archives so you can search, inspect, and reuse prior session context without treating raw JSONL logs as a database.
@@ -18,6 +20,65 @@ Or install directly from GitHub:
 cargo install --git https://github.com/HanifCarroll/codex-recall
 ```
 
+## Quick Start
+
+Index your local Codex archives, then query them:
+
+```bash
+codex-recall index
+codex-recall search "payment webhook"
+codex-recall recent --since 7d
+codex-recall doctor --json
+```
+
+If your transcripts live outside `~/.codex`, point the tool at them explicitly:
+
+```bash
+CODEX_HOME=/path/to/codex-home codex-recall index
+codex-recall index --source /path/to/exported/sessions
+```
+
+## Example Output
+
+Search returns grouped receipts with exact source lines:
+
+```text
+$ codex-recall search "signing secret" --db /tmp/codex-recall-demo/index.sqlite
+1. demo-session:84a7836c808a80c6  demo-session  /Users/me/projects/acme-api
+   - assistant_message  /tmp/codex-recall-demo/sessions/2026/04/13/demo.jsonl:3
+     The production signing secret was stale after the provider rotation.
+```
+
+Recent is useful when you know the repo or time window but not the query:
+
+```text
+$ codex-recall recent --repo acme-api --since 30d --db /tmp/codex-recall-demo/index.sqlite
+1. demo-session:84a7836c808a80c6  demo-session  acme-api
+   when: 2026-04-13T01:00:00Z
+   cwd: /Users/me/projects/acme-api
+   source: /tmp/codex-recall-demo/sessions/2026/04/13/demo.jsonl
+   show: codex-recall show 'demo-session:84a7836c808a80c6' --limit 120
+```
+
+Doctor gives a fast health check for the index:
+
+```json
+{
+  "ok": true,
+  "checks": {
+    "fts_integrity": "ok",
+    "quick_check": "ok"
+  },
+  "stats": {
+    "duplicate_source_files": 0,
+    "events": 3,
+    "sessions": 1,
+    "source_files": 1
+  },
+  "freshness": "fresh"
+}
+```
+
 ## Support Scope
 
 - Works anywhere you have Codex-style session JSONL archives on disk.
@@ -25,6 +86,14 @@ cargo install --git https://github.com/HanifCarroll/codex-recall
 - Honors `CODEX_HOME` when Codex data lives somewhere else.
 - Stores index and pin data under XDG-style data/state paths when available, otherwise falls back to `~/.local/share` and `~/.local/state`.
 - `watch --install-launch-agent` is macOS-only because it writes and manages a LaunchAgent plist.
+
+## Privacy and Safety
+
+- Transcript files stay local. `codex-recall` reads JSONL archives from disk and builds a local SQLite index.
+- The SQLite index is disposable. You can delete it and rebuild from the raw transcript files.
+- Pins are stored locally as JSON outside the SQLite index so they survive rebuilds.
+- Secret redaction is best-effort. It catches common token patterns before indexing, but it is not a hard security boundary.
+- If your transcripts contain data that should never be indexed, keep those files out of the configured source roots.
 
 ## Default Paths
 
@@ -217,3 +286,12 @@ When an agent needs prior-session context:
 ## Verification Notes
 
 In development, a full rebuild across a four-digit session-file archive completed in tens of minutes, and repeat indexing runs were much faster because unchanged files were skipped.
+
+## Release Process
+
+- CI runs `cargo fmt --check`, `cargo clippy --all-targets -- -D warnings`, and `cargo test` on every push to `main` and on pull requests.
+- Release notes live in [CHANGELOG.md](CHANGELOG.md).
+
+## Project Status
+
+This is maintained as a personal tool that happens to be public. Bug reports are useful. I am not actively reviewing outside pull requests.
