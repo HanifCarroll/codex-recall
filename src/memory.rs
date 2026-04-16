@@ -206,8 +206,9 @@ fn strip_prefix_ci<'a>(value: &'a str, prefix: &str) -> Option<&'a str> {
     if value.len() < prefix.len() {
         return None;
     }
-    if value[..prefix.len()].eq_ignore_ascii_case(prefix) {
-        return Some(value[prefix.len()..].trim());
+    let head = value.get(..prefix.len())?;
+    if head.eq_ignore_ascii_case(prefix) {
+        return Some(value.get(prefix.len()..).unwrap_or_default().trim());
     }
     None
 }
@@ -259,5 +260,10 @@ mod tests {
         assert_eq!(extracted[0].summary, "Keep MCP resources JSON-only.");
         assert!(extracted[0].id.starts_with("mem_decision_"));
         assert_eq!(extracted[1].kind, MemoryKind::Task);
+    }
+
+    #[test]
+    fn ignores_non_matching_multibyte_prefix_safely() {
+        assert_eq!(strip_prefix_ci("Here’s a note", "note:"), None);
     }
 }
