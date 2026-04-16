@@ -202,6 +202,7 @@ codex-recall search "source-map" --all-repos
 codex-recall search "source-map" --include-duplicates
 codex-recall search "source-map" --kind command
 codex-recall recent --limit 10
+codex-recall recent --all-repos
 codex-recall recent --json
 codex-recall memories --limit 10 --trace --json
 codex-recall resources --limit 10 --json
@@ -233,6 +234,7 @@ codex-recall unpin <session-key> --pins /tmp/pins.json
 - Accepts `--exclude-current` when `CODEX_SESSION_ID` or `CODEX_THREAD_ID` is set.
 - Interprets `today` and `yesterday` using the local day boundary, then compares against UTC transcript timestamps.
 - Boosts results from the current git repo by default. Use `--repo` to filter to a repo, or `--all-repos` to disable the current-repo boost.
+- Accepts `recent --all-repos` for command-shape parity with `search` and `bundle`; `recent` already spans all repos unless `--repo` is set.
 - Tracks file size and mtime so repeat indexing skips unchanged sessions.
 - Reports indexing progress to stderr with discovered file totals, bytes processed, elapsed time, ETA, current file, and skipped-file reason counts.
 - Watches session roots with a polling freshness loop, waits for files to be quiet before indexing, and records watcher state in the configured state path.

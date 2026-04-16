@@ -1888,6 +1888,44 @@ fn recent_json_supports_day_and_kind_filter() {
 }
 
 #[test]
+fn recent_accepts_all_repos_for_search_parity() {
+    let temp = temp_dir("recent-all-repos");
+    let source = temp.join("sessions");
+    let db = temp.join("index.sqlite");
+    let workspace = temp.join("project");
+    fs::create_dir_all(workspace.join(".git")).unwrap();
+    write_session(
+        &source,
+        "project-session",
+        workspace.to_str().unwrap(),
+        "2026-04-13T01:00:00Z",
+    );
+    write_session(
+        &source,
+        "other-session",
+        "/Users/me/projects/other",
+        "2026-04-13T02:00:00Z",
+    );
+    index_sources(&db, &[&source]);
+
+    let recent = Command::new(env!("CARGO_BIN_EXE_codex-recall"))
+        .current_dir(&workspace)
+        .args(["recent", "--all-repos", "--db"])
+        .arg(&db)
+        .output()
+        .unwrap();
+    assert!(
+        recent.status.success(),
+        "recent failed: {}",
+        String::from_utf8_lossy(&recent.stderr)
+    );
+
+    let stdout = String::from_utf8_lossy(&recent.stdout);
+    assert!(stdout.contains("project-session"), "{stdout}");
+    assert!(stdout.contains("other-session"), "{stdout}");
+}
+
+#[test]
 fn show_json_supports_kind_filter() {
     let temp = temp_dir("show-json-kind");
     let source = temp.join("sessions");
