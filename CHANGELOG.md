@@ -6,6 +6,10 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ## [Unreleased]
 
+### Fixed
+
+- Accepted `recent --all-repos` as a compatibility alias so agent-generated commands stop failing, and clarified in the docs that `recent` is already cross-repo unless `--repo` is set.
+
 ## [0.1.3] - 2026-04-15
 
 ### Added

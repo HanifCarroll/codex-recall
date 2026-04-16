@@ -18,6 +18,11 @@ pub struct RecentArgs {
     pub limit: usize,
     #[arg(long, help = "Restrict sessions to a repo name")]
     pub repo: Option<String>,
+    #[arg(
+        long,
+        help = "Accepted for parity with search/bundle; recent already spans all repos unless --repo is set"
+    )]
+    pub all_repos: bool,
     #[arg(long, help = "Restrict sessions to a cwd substring")]
     pub cwd: Option<String>,
     #[arg(long, help = "Restrict by age, for example 7d, today, or 2026-04-01")]
