@@ -1,6 +1,10 @@
 use std::fs;
 use std::path::PathBuf;
 use std::process::Command;
+use std::thread;
+use std::time::Duration;
+
+use rusqlite::Connection;
 
 fn temp_dir(name: &str) -> PathBuf {
     let dir = std::env::temp_dir().join(format!(
@@ -268,6 +272,130 @@ fn help_uses_generic_launch_agent_defaults() {
         !doctor_stdout.contains("com.hanif.codex-recall.watch"),
         "{doctor_stdout}"
     );
+}
+
+#[test]
+fn watch_once_indexes_archived_session_with_curly_apostrophe() {
+    let temp = temp_dir("watch-curly-apostrophe");
+    let source = temp.join("archived_sessions");
+    let db = temp.join("index.sqlite");
+    let state = temp.join("watch.json");
+    write_session_file(
+        &source,
+        "curly-apostrophe.jsonl",
+        "session-curly",
+        "/Users/me/projects/codex-recall",
+        "2026-04-13T01:00:00Z",
+        "Here’s a note from an archived session.",
+    );
+
+    let watch = Command::new(env!("CARGO_BIN_EXE_codex-recall"))
+        .args(["watch", "--once", "--quiet-for", "0", "--db"])
+        .arg(&db)
+        .args(["--state"])
+        .arg(&state)
+        .args(["--source"])
+        .arg(&source)
+        .output()
+        .unwrap();
+    assert!(
+        watch.status.success(),
+        "watch failed\nstdout:\n{}\nstderr:\n{}",
+        String::from_utf8_lossy(&watch.stdout),
+        String::from_utf8_lossy(&watch.stderr)
+    );
+    assert!(
+        String::from_utf8_lossy(&watch.stdout).contains("watch indexed 1 session files"),
+        "{}",
+        String::from_utf8_lossy(&watch.stdout)
+    );
+
+    let search = Command::new(env!("CARGO_BIN_EXE_codex-recall"))
+        .args(["search", "archived session", "--db"])
+        .arg(&db)
+        .output()
+        .unwrap();
+    assert!(
+        search.status.success(),
+        "search failed: {}",
+        String::from_utf8_lossy(&search.stderr)
+    );
+    let stdout = String::from_utf8_lossy(&search.stdout);
+    assert!(stdout.contains("session-curly"), "{stdout}");
+    assert!(stdout.contains("Here’s a note"), "{stdout}");
+}
+
+#[test]
+fn watch_once_supports_repo_and_since_bounds_without_scanning_older_archives() {
+    let temp = temp_dir("watch-bounded-repo-since");
+    let source = temp.join("sessions");
+    let db = temp.join("index.sqlite");
+    let state = temp.join("watch.json");
+    let old_dir = source.join("2026/04/12");
+    fs::create_dir_all(&old_dir).unwrap();
+    fs::write(old_dir.join("broken-old.jsonl"), "{not-json\n").unwrap();
+    write_session_file(
+        &source,
+        "matching.jsonl",
+        "matching-session",
+        "/Users/me/projects/codex-recall",
+        "2026-04-13T01:00:00Z",
+        "Bounded watcher should index this codex recall session.",
+    );
+    write_session_file(
+        &source,
+        "other-repo.jsonl",
+        "other-session",
+        "/Users/me/projects/other-tool",
+        "2026-04-13T01:00:00Z",
+        "Bounded watcher should skip this other repo session.",
+    );
+
+    let watch = Command::new(env!("CARGO_BIN_EXE_codex-recall"))
+        .args([
+            "watch",
+            "--once",
+            "--quiet-for",
+            "0",
+            "--repo",
+            "codex-recall",
+            "--since",
+            "2026-04-13",
+            "--db",
+        ])
+        .arg(&db)
+        .args(["--state"])
+        .arg(&state)
+        .args(["--source"])
+        .arg(&source)
+        .output()
+        .unwrap();
+    assert!(
+        watch.status.success(),
+        "watch failed\nstdout:\n{}\nstderr:\n{}",
+        String::from_utf8_lossy(&watch.stdout),
+        String::from_utf8_lossy(&watch.stderr)
+    );
+    assert!(
+        String::from_utf8_lossy(&watch.stdout).contains("watch indexed 1 session files"),
+        "{}",
+        String::from_utf8_lossy(&watch.stdout)
+    );
+
+    let search = Command::new(env!("CARGO_BIN_EXE_codex-recall"))
+        .args(["search", "Bounded watcher", "--json", "--db"])
+        .arg(&db)
+        .output()
+        .unwrap();
+    assert!(
+        search.status.success(),
+        "search failed: {}",
+        String::from_utf8_lossy(&search.stderr)
+    );
+    let json: serde_json::Value = serde_json::from_slice(&search.stdout).unwrap();
+    let results = json["results"].as_array().unwrap();
+    assert_eq!(results.len(), 1, "{json:#}");
+    assert_eq!(results[0]["session_id"], "matching-session");
 }
 
 #[test]
@@ -1449,6 +1577,282 @@ fn status_json_reports_fresh_and_live_write_verdicts() {
 }
 
 #[test]
+fn status_json_describes_mixed_stable_and_live_backlog() {
+    let temp = temp_dir("status-mixed-backlog");
+    let source = temp.join("sessions");
+    let db = temp.join("index.sqlite");
+    let state = temp.join("watch-state.json");
+    write_sample_session(&source);
+
+    let initial_watch = Command::new(env!("CARGO_BIN_EXE_codex-recall"))
+        .args(["watch", "--once", "--quiet-for", "0", "--db"])
+        .arg(&db)
+        .args(["--state"])
+        .arg(&state)
+        .args(["--source"])
+        .arg(&source)
+        .output()
+        .unwrap();
+    assert!(initial_watch.status.success());
+
+    write_session_file(
+        &source,
+        "stable.jsonl",
+        "stable-session",
+        "/Users/me/project",
+        "2026-04-13T03:00:00Z",
+        "The stable pending session should index next.",
+    );
+    thread::sleep(Duration::from_millis(1100));
+    write_session_file(
+        &source,
+        "live.jsonl",
+        "live-session",
+        "/Users/me/project",
+        "2026-04-13T04:00:00Z",
+        "The live write is still settling.",
+    );
+
+    let status = Command::new(env!("CARGO_BIN_EXE_codex-recall"))
+        .args(["status", "--json", "--quiet-for", "1", "--db"])
+        .arg(&db)
+        .args(["--state"])
+        .arg(&state)
+        .args(["--source"])
+        .arg(&source)
+        .output()
+        .unwrap();
+    assert!(status.status.success());
+    let json: serde_json::Value = serde_json::from_slice(&status.stdout).unwrap();
+    assert_eq!(json["freshness"], "stale");
+    assert_eq!(json["stable_pending_files"], 1);
+    assert_eq!(json["waiting_files"], 1);
+    let message = json["freshness_message"].as_str().unwrap();
+    assert!(
+        message.contains("1 stable files are ready to index"),
+        "{message}"
+    );
+    assert!(
+        message.contains("1 files are still within the quiet window"),
+        "{message}"
+    );
+}
+
+#[test]
+fn watch_once_indexes_stable_files_even_when_live_writes_are_still_settling() {
+    let temp = temp_dir("watch-stable-while-live");
+    let source = temp.join("sessions");
+    let db = temp.join("index.sqlite");
+    let state = temp.join("watch-state.json");
+    write_sample_session(&source);
+    index_sources(&db, &[&source]);
+
+    write_session_file(
+        &source,
+        "stable.jsonl",
+        "stable-backlog",
+        "/Users/me/project",
+        "2026-04-13T03:00:00Z",
+        "The stable pending session should index now.",
+    );
+    thread::sleep(Duration::from_millis(1100));
+    write_session_file(
+        &source,
+        "live.jsonl",
+        "live-write",
+        "/Users/me/project",
+        "2026-04-13T04:00:00Z",
+        "The live write is still settling.",
+    );
+
+    let watch = Command::new(env!("CARGO_BIN_EXE_codex-recall"))
+        .args(["watch", "--once", "--quiet-for", "1", "--db"])
+        .arg(&db)
+        .args(["--state"])
+        .arg(&state)
+        .args(["--source"])
+        .arg(&source)
+        .output()
+        .unwrap();
+    assert!(
+        watch.status.success(),
+        "watch failed\nstdout:\n{}\nstderr:\n{}",
+        String::from_utf8_lossy(&watch.stdout),
+        String::from_utf8_lossy(&watch.stderr)
+    );
+    let stdout = String::from_utf8_lossy(&watch.stdout);
+    assert!(stdout.contains("watch indexed 1 session files"), "{stdout}");
+    assert!(
+        stdout.contains("1 pending files remain (1 still within quiet window)"),
+        "{stdout}"
+    );
+
+    let stable_search = Command::new(env!("CARGO_BIN_EXE_codex-recall"))
+        .args(["search", "stable pending session", "--db"])
+        .arg(&db)
+        .output()
+        .unwrap();
+    assert!(stable_search.status.success());
+    assert!(
+        String::from_utf8_lossy(&stable_search.stdout).contains("stable-backlog"),
+        "{}",
+        String::from_utf8_lossy(&stable_search.stdout)
+    );
+
+    let live_search = Command::new(env!("CARGO_BIN_EXE_codex-recall"))
+        .args(["search", "live write is still settling", "--db"])
+        .arg(&db)
+        .output()
+        .unwrap();
+    assert!(live_search.status.success());
+    assert!(
+        String::from_utf8_lossy(&live_search.stdout).contains("no matches"),
+        "{}",
+        String::from_utf8_lossy(&live_search.stdout)
+    );
+
+    let status = Command::new(env!("CARGO_BIN_EXE_codex-recall"))
+        .args(["status", "--json", "--quiet-for", "1", "--db"])
+        .arg(&db)
+        .args(["--state"])
+        .arg(&state)
+        .args(["--source"])
+        .arg(&source)
+        .output()
+        .unwrap();
+    assert!(status.status.success());
+    let json: serde_json::Value = serde_json::from_slice(&status.stdout).unwrap();
+    assert_eq!(json["freshness"], "pending-live-writes");
+    assert_eq!(json["pending_files"], 1);
+    assert_eq!(json["stable_pending_files"], 0);
+    assert_eq!(json["waiting_files"], 1);
+}
+
+#[test]
+fn status_json_reports_using_stale_index_after_lock_failure() {
+    let temp = temp_dir("status-stale-lock");
+    let source = temp.join("sessions");
+    let db = temp.join("index.sqlite");
+    let state = temp.join("watch-state.json");
+    write_sample_session(&source);
+    index_sources(&db, &[&source]);
+    fs::write(
+        &state,
+        r#"{"last_run_at":"2026-04-13T01:00:00.000Z","last_indexed_at":"2026-04-13T01:00:00.000Z","last_error":"database is locked; using stale index","last_indexed_sessions":1,"last_indexed_events":2,"last_files_seen":1,"last_files_total":1,"pending_files":1}"#,
+    )
+    .unwrap();
+
+    let status = Command::new(env!("CARGO_BIN_EXE_codex-recall"))
+        .args(["status", "--json", "--db"])
+        .arg(&db)
+        .args(["--state"])
+        .arg(&state)
+        .args(["--source"])
+        .arg(&source)
+        .output()
+        .unwrap();
+    assert!(
+        status.status.success(),
+        "status failed: {}",
+        String::from_utf8_lossy(&status.stderr)
+    );
+    let json: serde_json::Value = serde_json::from_slice(&status.stdout).unwrap();
+    assert_eq!(json["freshness"], "using-stale-index");
+    assert!(json["freshness_message"]
+        .as_str()
+        .unwrap()
+        .contains("database is locked"));
+    assert!(json["freshness_message"]
+        .as_str()
+        .unwrap()
+        .contains("stale index"));
+}
+
+#[test]
+fn watch_once_uses_stale_index_when_refresh_database_is_locked() {
+    let temp = temp_dir("watch-stale-lock");
+    let source = temp.join("sessions");
+    let db = temp.join("index.sqlite");
+    let state = temp.join("watch-state.json");
+    write_session_file(
+        &source,
+        "old.jsonl",
+        "old-session",
+        "/Users/me/project",
+        "2026-04-13T01:00:00Z",
+        "The old indexed session is still searchable.",
+    );
+    index_sources(&db, &[&source]);
+    write_session_file(
+        &source,
+        "new.jsonl",
+        "new-session",
+        "/Users/me/project",
+        "2026-04-13T02:00:00Z",
+        "The new pending session is not indexed yet.",
+    );
+
+    let lock = Connection::open(&db).unwrap();
+    lock.execute_batch("BEGIN IMMEDIATE").unwrap();
+
+    let watch = Command::new(env!("CARGO_BIN_EXE_codex-recall"))
+        .env("CODEX_RECALL_SQLITE_BUSY_TIMEOUT_MS", "1")
+        .env("CODEX_RECALL_WATCH_LOCK_RETRY_MS", "1")
+        .env("CODEX_RECALL_WATCH_LOCK_RETRIES", "2")
+        .args(["watch", "--once", "--quiet-for", "0", "--db"])
+        .arg(&db)
+        .args(["--state"])
+        .arg(&state)
+        .args(["--source"])
+        .arg(&source)
+        .output()
+        .unwrap();
+    assert!(
+        watch.status.success(),
+        "watch failed\nstdout:\n{}\nstderr:\n{}",
+        String::from_utf8_lossy(&watch.stdout),
+        String::from_utf8_lossy(&watch.stderr)
+    );
+    let stdout = String::from_utf8_lossy(&watch.stdout);
+    assert!(stdout.contains("using stale index"), "{stdout}");
+    assert!(stdout.contains("database is locked"), "{stdout}");
+
+    let status = Command::new(env!("CARGO_BIN_EXE_codex-recall"))
+        .args(["status", "--json", "--db"])
+        .arg(&db)
+        .args(["--state"])
+        .arg(&state)
+        .args(["--source"])
+        .arg(&source)
+        .output()
+        .unwrap();
+    assert!(status.status.success());
+    let json: serde_json::Value = serde_json::from_slice(&status.stdout).unwrap();
+    assert_eq!(json["freshness"], "using-stale-index");
+    assert_eq!(json["pending_files"], 1);
+
+    drop(lock);
+
+    let old_search = Command::new(env!("CARGO_BIN_EXE_codex-recall"))
+        .args(["search", "old indexed", "--db"])
+        .arg(&db)
+        .output()
+        .unwrap();
+    assert!(old_search.status.success());
+    let stdout = String::from_utf8_lossy(&old_search.stdout);
+    assert!(stdout.contains("old-session"), "{stdout}");
+
+    let new_search = Command::new(env!("CARGO_BIN_EXE_codex-recall"))
+        .args(["search", "new pending", "--db"])
+        .arg(&db)
+        .output()
+        .unwrap();
+    assert!(new_search.status.success());
+    let stdout = String::from_utf8_lossy(&new_search.stdout);
+    assert!(stdout.contains("no matches"), "{stdout}");
+}
+
+#[test]
 fn watch_once_indexes_stable_sessions_and_writes_status() {
     let temp = temp_dir("watch-once");
     let source = temp.join("sessions");
@@ -1495,6 +1899,122 @@ fn watch_once_indexes_stable_sessions_and_writes_status() {
     assert_eq!(json["last_error"], serde_json::Value::Null);
     assert_eq!(json["last_indexed_sessions"], 1);
     assert!(json["last_run_at"].as_str().is_some());
+}
+
+#[test]
+fn status_and_doctor_support_repo_and_since_filters() {
+    let temp = temp_dir("status-doctor-filters");
+    let source = temp.join("sessions");
+    let db = temp.join("index.sqlite");
+    let state = temp.join("watch.json");
+    let old_dir = source.join("2026/04/12");
+    fs::create_dir_all(&old_dir).unwrap();
+    fs::write(old_dir.join("broken-old.jsonl"), "{not-json\n").unwrap();
+    write_session_file(
+        &source,
+        "matching.jsonl",
+        "matching-session",
+        "/Users/me/projects/codex-recall",
+        "2026-04-13T01:00:00Z",
+        "Filtered status should stay focused on this session.",
+    );
+
+    let watch = Command::new(env!("CARGO_BIN_EXE_codex-recall"))
+        .args([
+            "watch",
+            "--once",
+            "--quiet-for",
+            "0",
+            "--repo",
+            "codex-recall",
+            "--since",
+            "2026-04-13",
+            "--db",
+        ])
+        .arg(&db)
+        .args(["--state"])
+        .arg(&state)
+        .args(["--source"])
+        .arg(&source)
+        .output()
+        .unwrap();
+    assert!(
+        watch.status.success(),
+        "watch failed\nstdout:\n{}\nstderr:\n{}",
+        String::from_utf8_lossy(&watch.stdout),
+        String::from_utf8_lossy(&watch.stderr)
+    );
+
+    let unfiltered_status = Command::new(env!("CARGO_BIN_EXE_codex-recall"))
+        .args(["status", "--json", "--quiet-for", "0", "--db"])
+        .arg(&db)
+        .args(["--state"])
+        .arg(&state)
+        .args(["--source"])
+        .arg(&source)
+        .output()
+        .unwrap();
+    assert!(unfiltered_status.status.success());
+    let json: serde_json::Value = serde_json::from_slice(&unfiltered_status.stdout).unwrap();
+    assert_eq!(json["freshness"], "stale");
+    assert_eq!(json["pending_files"], 1);
+
+    let filtered_status = Command::new(env!("CARGO_BIN_EXE_codex-recall"))
+        .args([
+            "status",
+            "--json",
+            "--quiet-for",
+            "0",
+            "--repo",
+            "codex-recall",
+            "--since",
+            "2026-04-13",
+            "--db",
+        ])
+        .arg(&db)
+        .args(["--state"])
+        .arg(&state)
+        .args(["--source"])
+        .arg(&source)
+        .output()
+        .unwrap();
+    assert!(filtered_status.status.success());
+    let json: serde_json::Value = serde_json::from_slice(&filtered_status.stdout).unwrap();
+    assert_eq!(json["freshness"], "fresh");
+    assert_eq!(json["pending_files"], 0);
+    assert_eq!(json["filters"]["repo"], "codex-recall");
+    assert_eq!(json["filters"]["since"], "2026-04-13");
+
+    let filtered_doctor = Command::new(env!("CARGO_BIN_EXE_codex-recall"))
+        .args([
+            "doctor",
+            "--json",
+            "--quiet-for",
+            "0",
+            "--repo",
+            "codex-recall",
+            "--since",
+            "2026-04-13",
+            "--db",
+        ])
+        .arg(&db)
+        .args(["--state"])
+        .arg(&state)
+        .args(["--source"])
+        .arg(&source)
+        .output()
+        .unwrap();
+    assert!(filtered_doctor.status.success());
+    let json: serde_json::Value = serde_json::from_slice(&filtered_doctor.stdout).unwrap();
+    assert_eq!(json["freshness"]["state"], "fresh");
+    assert_eq!(
+        json["freshness"]["status"]["filters"]["repo"],
+        "codex-recall"
+    );
+    assert_eq!(
+        json["freshness"]["status"]["filters"]["since"],
+        "2026-04-13"
+    );
 }
 
 #[test]
@@ -1648,7 +2168,7 @@ fn doctor_json_includes_freshness_verdict() {
     assert!(json["freshness"]["message"]
         .as_str()
         .unwrap()
-        .contains("pending stable files"));
+        .contains("watcher has no state"));
 }
 
 #[test]

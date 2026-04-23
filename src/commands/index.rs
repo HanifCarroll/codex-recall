@@ -33,13 +33,14 @@ pub fn run_index(args: IndexArgs) -> Result<()> {
         eprintln!("{}", progress_line(report, started.elapsed()));
     })?;
     println!(
-        "indexed {} session files, {} events from {}/{} files ({} skipped: {} unchanged, {} missing, {} non-session) into {}",
+        "indexed {} session files, {} events from {}/{} files ({} skipped: {} unchanged, {} filtered, {} missing, {} non-session) into {}",
         report.sessions_indexed,
         report.events_indexed,
         report.files_seen,
         report.files_total,
         report.files_skipped,
         report.skipped_unchanged,
+        report.skipped_filtered,
         report.skipped_missing,
         report.skipped_non_session,
         db_path.display()
@@ -57,13 +58,14 @@ pub fn run_rebuild(args: RebuildArgs) -> Result<()> {
         eprintln!("{}", progress_line(report, started.elapsed()));
     })?;
     println!(
-        "rebuilt {} session files, {} events from {}/{} files ({} skipped: {} unchanged, {} missing, {} non-session) into {}",
+        "rebuilt {} session files, {} events from {}/{} files ({} skipped: {} unchanged, {} filtered, {} missing, {} non-session) into {}",
         report.sessions_indexed,
         report.events_indexed,
         report.files_seen,
         report.files_total,
         report.files_skipped,
         report.skipped_unchanged,
+        report.skipped_filtered,
         report.skipped_missing,
         report.skipped_non_session,
         db_path.display()

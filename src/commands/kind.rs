@@ -3,24 +3,26 @@ use clap::ValueEnum;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum)]
 pub enum KindArg {
-    User,
-    Assistant,
+    #[value(name = "user_message", alias = "user")]
+    UserMessage,
+    #[value(name = "assistant_message", alias = "assistant")]
+    AssistantMessage,
     Command,
 }
 
 impl KindArg {
     pub fn as_str(self) -> &'static str {
         match self {
-            Self::User => "user",
-            Self::Assistant => "assistant",
+            Self::UserMessage => "user_message",
+            Self::AssistantMessage => "assistant_message",
             Self::Command => "command",
         }
     }
 
     pub fn event_kind(self) -> EventKind {
         match self {
-            Self::User => EventKind::UserMessage,
-            Self::Assistant => EventKind::AssistantMessage,
+            Self::UserMessage => EventKind::UserMessage,
+            Self::AssistantMessage => EventKind::AssistantMessage,
             Self::Command => EventKind::Command,
         }
     }

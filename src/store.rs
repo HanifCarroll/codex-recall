@@ -1,3 +1,4 @@
+use crate::commands::date::{parse_date_filter, DateFilter};
 use crate::memory::{extract_memories, ExtractedMemory, MemoryKind};
 use crate::parser::{EventKind, ParsedSession};
 use anyhow::{bail, Context, Result};
@@ -52,12 +53,22 @@ pub struct SearchOptions {
     pub exclude_sessions: Vec<String>,
     pub kinds: Vec<EventKind>,
     pub current_repo: Option<String>,
+    pub mode: SearchMode,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SearchMode {
+    AllTerms,
+    Phrase,
+    Near(u32),
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum MatchStrategy {
     AllTerms,
     AnyTermFallback,
+    Phrase,
+    Near,
 }
 
 impl MatchStrategy {
@@ -65,6 +76,8 @@ impl MatchStrategy {
         match self {
             MatchStrategy::AllTerms => "all_terms",
             MatchStrategy::AnyTermFallback => "any_terms_fallback",
+            MatchStrategy::Phrase => "phrase",
+            MatchStrategy::Near => "near",
         }
     }
 }
@@ -227,6 +240,7 @@ impl SearchOptions {
             exclude_sessions: Vec::new(),
             kinds: Vec::new(),
             current_repo: None,
+            mode: SearchMode::AllTerms,
         }
     }
 }
@@ -433,45 +447,91 @@ impl Store {
 
         let limit = options.limit.clamp(1, 100);
         let fetch_limit = limit.saturating_mul(50).clamp(200, 1_000);
-        let all_terms_query = and_fts_query(&terms);
-        let results = self.search_with_fts_query(&options, &all_terms_query, fetch_limit)?;
-        if !results.is_empty() || terms.len() == 1 {
-            return Ok((
-                SearchTrace {
-                    match_strategy: MatchStrategy::AllTerms,
-                    query_terms: terms,
-                    fts_query: all_terms_query,
-                    fetch_limit,
-                    current_repo: options.current_repo.clone(),
-                    include_duplicates: options.include_duplicates,
-                },
-                rank_search_results(
-                    results,
-                    options.current_repo.as_deref(),
-                    limit,
-                    options.include_duplicates,
-                ),
-            ));
-        }
+        match options.mode {
+            SearchMode::AllTerms => {
+                let all_terms_query = and_fts_query(&terms);
+                let results =
+                    self.search_with_fts_query(&options, &all_terms_query, fetch_limit)?;
+                if !results.is_empty() || terms.len() == 1 {
+                    return Ok((
+                        SearchTrace {
+                            match_strategy: MatchStrategy::AllTerms,
+                            query_terms: terms,
+                            fts_query: all_terms_query,
+                            fetch_limit,
+                            current_repo: options.current_repo.clone(),
+                            include_duplicates: options.include_duplicates,
+                        },
+                        rank_search_results(
+                            results,
+                            options.current_repo.as_deref(),
+                            limit,
+                            options.include_duplicates,
+                        ),
+                    ));
+                }
 
-        let any_terms_query = or_fts_query(&terms);
-        let results = self.search_with_fts_query(&options, &any_terms_query, fetch_limit)?;
-        Ok((
-            SearchTrace {
-                match_strategy: MatchStrategy::AnyTermFallback,
-                query_terms: terms,
-                fts_query: any_terms_query,
-                fetch_limit,
-                current_repo: options.current_repo.clone(),
-                include_duplicates: options.include_duplicates,
-            },
-            rank_search_results(
-                results,
-                options.current_repo.as_deref(),
-                limit,
-                options.include_duplicates,
-            ),
-        ))
+                let any_terms_query = or_fts_query(&terms);
+                let results =
+                    self.search_with_fts_query(&options, &any_terms_query, fetch_limit)?;
+                Ok((
+                    SearchTrace {
+                        match_strategy: MatchStrategy::AnyTermFallback,
+                        query_terms: terms,
+                        fts_query: any_terms_query,
+                        fetch_limit,
+                        current_repo: options.current_repo.clone(),
+                        include_duplicates: options.include_duplicates,
+                    },
+                    rank_search_results(
+                        results,
+                        options.current_repo.as_deref(),
+                        limit,
+                        options.include_duplicates,
+                    ),
+                ))
+            }
+            SearchMode::Phrase => {
+                let phrase_query = phrase_fts_query(&terms);
+                let results = self.search_with_fts_query(&options, &phrase_query, fetch_limit)?;
+                Ok((
+                    SearchTrace {
+                        match_strategy: MatchStrategy::Phrase,
+                        query_terms: terms,
+                        fts_query: phrase_query,
+                        fetch_limit,
+                        current_repo: options.current_repo.clone(),
+                        include_duplicates: options.include_duplicates,
+                    },
+                    rank_search_results(
+                        results,
+                        options.current_repo.as_deref(),
+                        limit,
+                        options.include_duplicates,
+                    ),
+                ))
+            }
+            SearchMode::Near(distance) => {
+                let near_query = near_fts_query(&terms, distance);
+                let results = self.search_with_fts_query(&options, &near_query, fetch_limit)?;
+                Ok((
+                    SearchTrace {
+                        match_strategy: MatchStrategy::Near,
+                        query_terms: terms,
+                        fts_query: near_query,
+                        fetch_limit,
+                        current_repo: options.current_repo.clone(),
+                        include_duplicates: options.include_duplicates,
+                    },
+                    rank_search_results(
+                        results,
+                        options.current_repo.as_deref(),
+                        limit,
+                        options.include_duplicates,
+                    ),
+                ))
+            }
+        }
     }
 
     fn search_with_fts_query(
@@ -2108,7 +2168,7 @@ impl Store {
 }
 
 fn configure_write_connection(conn: &Connection) -> Result<()> {
-    conn.busy_timeout(Duration::from_secs(30))?;
+    conn.busy_timeout(sqlite_busy_timeout())?;
     conn.execute_batch(
         r#"
         PRAGMA journal_mode = WAL;
@@ -2120,7 +2180,7 @@ fn configure_write_connection(conn: &Connection) -> Result<()> {
 }
 
 fn configure_read_connection(conn: &Connection) -> Result<()> {
-    conn.busy_timeout(Duration::from_secs(30))?;
+    conn.busy_timeout(sqlite_busy_timeout())?;
     conn.execute_batch(
         r#"
         PRAGMA query_only = ON;
@@ -2130,48 +2190,12 @@ fn configure_read_connection(conn: &Connection) -> Result<()> {
     Ok(())
 }
 
-enum SinceFilter {
-    Absolute(String),
-    LastDays(u32),
-    Today,
-    Yesterday,
-}
-
-fn parse_date_filter(value: &str, flag_name: &str) -> Result<SinceFilter> {
-    let trimmed = value.trim();
-    let lower = trimmed.to_ascii_lowercase();
-    if lower == "today" {
-        return Ok(SinceFilter::Today);
-    }
-    if lower == "yesterday" {
-        return Ok(SinceFilter::Yesterday);
-    }
-    if let Some(days) = lower.strip_suffix('d') {
-        let days = days
-            .parse::<u32>()
-            .with_context(|| format!("parse {flag_name} relative day value `{value}`"))?;
-        if days == 0 {
-            return Ok(SinceFilter::Today);
-        }
-        return Ok(SinceFilter::LastDays(days));
-    }
-    if looks_like_absolute_date(trimmed) {
-        return Ok(SinceFilter::Absolute(trimmed.to_owned()));
-    }
-
-    anyhow::bail!(
-        "unsupported {flag_name} value `{value}`; use YYYY-MM-DD, today, yesterday, or Nd like 7d"
-    )
-}
-
-fn looks_like_absolute_date(value: &str) -> bool {
-    let bytes = value.as_bytes();
-    bytes.len() >= 10
-        && bytes[0..4].iter().all(|byte| byte.is_ascii_digit())
-        && bytes[4] == b'-'
-        && bytes[5..7].iter().all(|byte| byte.is_ascii_digit())
-        && bytes[7] == b'-'
-        && bytes[8..10].iter().all(|byte| byte.is_ascii_digit())
+fn sqlite_busy_timeout() -> Duration {
+    std::env::var("CODEX_RECALL_SQLITE_BUSY_TIMEOUT_MS")
+        .ok()
+        .and_then(|value| value.parse::<u64>().ok())
+        .map(Duration::from_millis)
+        .unwrap_or_else(|| Duration::from_secs(30))
 }
 
 fn append_since_clause(
@@ -2192,18 +2216,18 @@ fn append_lower_bound_clause(
         " AND datetime(replace(replace(sessions.session_timestamp, 'T', ' '), 'Z', '')) >= ",
     );
     match parse_date_filter(value, flag_name)? {
-        SinceFilter::Absolute(value) => {
+        DateFilter::Absolute(value) => {
             sql.push_str("datetime(?)");
             query_params.push(value);
         }
-        SinceFilter::LastDays(days) => {
+        DateFilter::LastDays(days) => {
             sql.push_str("datetime('now', ?)");
             query_params.push(format!("-{days} days"));
         }
-        SinceFilter::Today => {
+        DateFilter::Today => {
             sql.push_str("datetime('now', 'localtime', 'start of day', 'utc')");
         }
-        SinceFilter::Yesterday => {
+        DateFilter::Yesterday => {
             sql.push_str("datetime('now', 'localtime', 'start of day', '-1 day', 'utc')");
         }
     }
@@ -2219,18 +2243,18 @@ fn append_until_clause(
         " AND datetime(replace(replace(sessions.session_timestamp, 'T', ' '), 'Z', '')) < ",
     );
     match parse_date_filter(value, "--until")? {
-        SinceFilter::Absolute(value) => {
+        DateFilter::Absolute(value) => {
             sql.push_str("datetime(?)");
             query_params.push(value);
         }
-        SinceFilter::LastDays(days) => {
+        DateFilter::LastDays(days) => {
             sql.push_str("datetime('now', ?)");
             query_params.push(format!("-{days} days"));
         }
-        SinceFilter::Today => {
+        DateFilter::Today => {
             sql.push_str("datetime('now', 'localtime', 'start of day', 'utc')");
         }
-        SinceFilter::Yesterday => {
+        DateFilter::Yesterday => {
             sql.push_str("datetime('now', 'localtime', 'start of day', '-1 day', 'utc')");
         }
     }
@@ -2668,6 +2692,25 @@ fn or_fts_query(terms: &[String]) -> String {
         .join(" OR ")
 }
 
+fn phrase_fts_query(terms: &[String]) -> String {
+    quote_fts_term(&terms.join(" "))
+}
+
+fn near_fts_query(terms: &[String], distance: u32) -> String {
+    if terms.len() <= 1 {
+        return and_fts_query(terms);
+    }
+
+    format!(
+        "NEAR({}, {distance})",
+        terms
+            .iter()
+            .map(|term| quote_fts_term(term))
+            .collect::<Vec<_>>()
+            .join(" ")
+    )
+}
+
 pub fn build_session_key(session_id: &str, source_file_path: &Path) -> String {
     session_key(session_id, source_file_path)
 }
@@ -2689,7 +2732,7 @@ fn fnv1a64(bytes: &[u8]) -> u64 {
     hash
 }
 
-fn repo_slug(cwd: &str) -> String {
+pub(crate) fn repo_slug(cwd: &str) -> String {
     Path::new(cwd)
         .file_name()
         .and_then(|name| name.to_str())

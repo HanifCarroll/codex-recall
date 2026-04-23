@@ -156,8 +156,10 @@ codex-recall index
 codex-recall rebuild
 codex-recall watch
 codex-recall watch --once
+codex-recall watch --once --repo acme-api --since 7d --quiet-for 0
 codex-recall watch --install-launch-agent --start-launch-agent
 codex-recall status
+codex-recall status --repo acme-api --since 7d --json
 codex-recall status --json
 codex-recall search "payment webhook"
 codex-recall search "payment webhook" --repo acme-api --since 2026-04-01
@@ -187,6 +189,7 @@ codex-recall pins --repo codex-recall
 codex-recall pins --repo codex-recall --json
 codex-recall unpin <session-key>
 codex-recall doctor --json
+codex-recall doctor --repo acme-api --since 7d --json
 codex-recall stats
 ```
 
@@ -195,8 +198,11 @@ Useful flags:
 ```bash
 codex-recall index --db /tmp/index.sqlite --source ~/.codex/sessions/2026/04
 codex-recall watch --interval 30 --quiet-for 5
+codex-recall watch --once --repo codex-recall --since 2026-04-13 --quiet-for 0
 codex-recall watch --install-launch-agent
 codex-recall watch --install-launch-agent --start-launch-agent
+codex-recall status --repo codex-recall --since 2026-04-13 --json
+codex-recall doctor --repo codex-recall --since 2026-04-13 --json
 codex-recall search "source-map" --limit 5
 codex-recall search "source-map" --all-repos
 codex-recall search "source-map" --include-duplicates
@@ -238,7 +244,10 @@ codex-recall unpin <session-key> --pins /tmp/pins.json
 - Tracks file size and mtime so repeat indexing skips unchanged sessions.
 - Reports indexing progress to stderr with discovered file totals, bytes processed, elapsed time, ETA, current file, and skipped-file reason counts.
 - Watches session roots with a polling freshness loop, waits for files to be quiet before indexing, and records watcher state in the configured state path.
-- Reports a blunt freshness verdict: `fresh`, `stale`, `pending-live-writes`, or `watcher-not-running`.
+- When settled backlog and live writes coexist, `watch` indexes the stable files first and leaves only the still-changing files pending.
+- Supports bounded one-shot watcher catch-ups with `watch --once --repo <repo> --since <date-or-window>` so agents can refresh the relevant recent slice without walking old archive directories.
+- `status` and `doctor` accept the same `--repo` and `--since` filters so freshness checks can match a bounded watch scope.
+- Reports a blunt freshness verdict: `fresh`, `stale`, `pending-live-writes`, `using-stale-index`, or `watcher-not-running`.
 - Reports freshness status with pending file counts, stable/waiting file counts, last indexed time, last watcher error, and LaunchAgent installed/running state.
 - Can write a macOS LaunchAgent plist for the watcher with `watch --install-launch-agent`.
 - Can bootstrap and verify that LaunchAgent immediately with `watch --install-launch-agent --start-launch-agent`.
@@ -260,7 +269,7 @@ codex-recall unpin <session-key> --pins /tmp/pins.json
 - Keeps `--json` output compact by returning `text_preview` instead of full transcript blobs.
 - Separates progress and diagnostics onto stderr so `--json` output stays pipe-safe.
 - Opens read-only commands without running schema migrations, so `search`, `recent`, `bundle`, `show`, `doctor`, and `stats` do not create missing databases or take writer locks.
-- Uses SQLite WAL mode, a 30-second busy timeout, and normal synchronous writes for better behavior when the watcher and read commands overlap.
+- Uses SQLite WAL mode, a 30-second busy timeout, normal synchronous writes, and lock-aware watcher retry/backoff so read commands and refreshes can overlap without confusing stale index data for missing results.
 
 ## Maintenance
 
@@ -269,6 +278,7 @@ Use `doctor` when the index feels stale or suspicious:
 ```bash
 codex-recall doctor
 codex-recall doctor --json
+codex-recall doctor --repo codex-recall --since 7d --json
 ```
 
 `doctor` is read-only when the database is missing. It reports the missing index instead of creating an empty one.
@@ -284,6 +294,7 @@ Use `watch` when the index should stay fresh while Codex writes new transcripts:
 ```bash
 codex-recall watch
 codex-recall status
+codex-recall status --repo codex-recall --since 7d --json
 ```
 
 On macOS, `watch --install-launch-agent` writes a plist to `~/Library/LaunchAgents/dev.codex-recall.watch.plist` by default and prints the `launchctl bootstrap` command to start it.
@@ -319,21 +330,22 @@ codex-recall unpin <session-key>
 When an agent needs prior-session context:
 
 1. Run `codex-recall status --json`.
-2. If `freshness` is `fresh` or `pending-live-writes`, continue. `pending-live-writes` means very recent files are still settling, so use existing results unless the current turn depends on the last few seconds.
-3. If `freshness` is `stale`, run `codex-recall watch --once --quiet-for 0` or `codex-recall index`, then check `status --json` again.
-4. If `freshness` is `watcher-not-running`, start the background watcher with `codex-recall watch --install-launch-agent --start-launch-agent`, then run `codex-recall watch --once --quiet-for 0` for an immediate catch-up.
-5. Use `codex-recall recent --repo <repo> --since 7d --limit 10` when you do not know the right search terms yet.
-6. For calendar-day review, prefer `codex-recall day YYYY-MM-DD --json` or `--day YYYY-MM-DD` on `recent`, `search`, and `bundle`.
-7. Use `codex-recall bundle "<query>" --repo <repo> --day YYYY-MM-DD --limit 5` for compact context.
-8. Use `codex-recall search "<query>" --json --day YYYY-MM-DD --exclude-current` when programmatic filtering is needed during an automation.
-9. Use `--kind user`, `--kind assistant`, or `--kind command` to narrow noisy searches.
-10. Add `--exclude-session <session-id-or-session-key>` when the current automation or session id is known and `--exclude-current` is unavailable.
-11. Keep the default deduped view unless the question is specifically about active/archive divergence. Use `--include-duplicates` only for that inspection.
-12. Use `codex-recall show <session_key> --json` only for sessions that look relevant from `bundle`, `search`, `day`, or `recent`.
-13. Use `codex-recall pin <session_key> --label "<why this matters>"` for canonical decisions or sessions that are likely to be reused.
-14. Use `codex-recall pins --json` when scripts or agents need stable pin data.
-15. Use `codex-recall unpin <session_key>` when a memory anchor is stale or mistaken.
-16. Treat transcript evidence as historical. Verify against the current repo before acting.
+2. If `freshness` is `fresh` or `pending-live-writes`, continue. `pending-live-writes` means the remaining backlog is only very recent files that are still settling.
+3. If `freshness` is `using-stale-index`, the last refresh could not take the SQLite writer lock after retry/backoff. Existing search results are usable, but a no-match result may mean the newest transcript files were not indexed yet. Retry `codex-recall watch --once --repo <repo> --since 7d --quiet-for 0` after the lock clears when the current turn depends on recent sessions.
+4. If `freshness` is `stale`, run `codex-recall watch --once --repo <repo> --since 7d --quiet-for 0` for a targeted catch-up, or use unbounded `codex-recall watch --once --quiet-for 0` / `codex-recall index` when a full refresh is required. Then check `status --repo <repo> --since 7d --json` again for the same scope.
+5. If `freshness` is `watcher-not-running`, start the background watcher with `codex-recall watch --install-launch-agent --start-launch-agent`, then run `codex-recall watch --once --repo <repo> --since 7d --quiet-for 0` for an immediate targeted catch-up.
+6. Use `codex-recall recent --repo <repo> --since 7d --limit 10` when you do not know the right search terms yet.
+7. For calendar-day review, prefer `codex-recall day YYYY-MM-DD --json` or `--day YYYY-MM-DD` on `recent`, `search`, and `bundle`.
+8. Use `codex-recall bundle "<query>" --repo <repo> --day YYYY-MM-DD --limit 5` for compact context.
+9. Use `codex-recall search "<query>" --json --day YYYY-MM-DD --exclude-current` when programmatic filtering is needed during an automation.
+10. Use `--kind user`, `--kind assistant`, or `--kind command` to narrow noisy searches.
+11. Add `--exclude-session <session-id-or-session-key>` when the current automation or session id is known and `--exclude-current` is unavailable.
+12. Keep the default deduped view unless the question is specifically about active/archive divergence. Use `--include-duplicates` only for that inspection.
+13. Use `codex-recall show <session_key> --json` only for sessions that look relevant from `bundle`, `search`, `day`, or `recent`.
+14. Use `codex-recall pin <session_key> --label "<why this matters>"` for canonical decisions or sessions that are likely to be reused.
+15. Use `codex-recall pins --json` when scripts or agents need stable pin data.
+16. Use `codex-recall unpin <session_key>` when a memory anchor is stale or mistaken.
+17. Treat transcript evidence as historical. Verify against the current repo before acting.
 
 ## Verification Notes
 

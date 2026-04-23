@@ -18,7 +18,7 @@ pub fn progress_line(report: &IndexReport, elapsed: Duration) -> String {
         .unwrap_or_else(|| "-".to_owned());
 
     format!(
-        "progress: {}/{} files ({percent:.1}%), bytes {}/{}, indexed {}, skipped {} (unchanged {}, missing {}, non-session {}), elapsed {}, eta {}, current {}",
+        "progress: {}/{} files ({percent:.1}%), bytes {}/{}, indexed {}, skipped {} (unchanged {}, filtered {}, missing {}, non-session {}), elapsed {}, eta {}, current {}",
         report.files_seen,
         report.files_total,
         format_bytes(report.bytes_seen),
@@ -26,6 +26,7 @@ pub fn progress_line(report: &IndexReport, elapsed: Duration) -> String {
         report.sessions_indexed,
         report.files_skipped,
         report.skipped_unchanged,
+        report.skipped_filtered,
         report.skipped_missing,
         report.skipped_non_session,
         format_duration(elapsed),
