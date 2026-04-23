@@ -132,6 +132,12 @@ pub(crate) struct LaunchAgentStatus {
     pub running: Option<bool>,
 }
 
+struct LaunchAgentWatchConfig<'a> {
+    interval: Duration,
+    quiet_for: Duration,
+    filters: &'a IndexFilters,
+}
+
 pub fn run_watch(args: WatchArgs) -> Result<()> {
     let db_path = args.db.unwrap_or(default_db_path()?);
     let state_path = args.state.unwrap_or(default_state_path()?);
@@ -155,9 +161,11 @@ pub fn run_watch(args: WatchArgs) -> Result<()> {
             &db_path,
             &state_path,
             &sources,
-            interval,
-            quiet_for,
-            &filters,
+            LaunchAgentWatchConfig {
+                interval,
+                quiet_for,
+                filters: &filters,
+            },
         )?;
         println!("installed launch agent: {}", agent_path.display());
         if args.start_launch_agent {
@@ -809,9 +817,7 @@ fn install_launch_agent_plist(
     db_path: &Path,
     state_path: &Path,
     sources: &[PathBuf],
-    interval: Duration,
-    quiet_for: Duration,
-    filters: &IndexFilters,
+    watch: LaunchAgentWatchConfig<'_>,
 ) -> Result<()> {
     if let Some(parent) = path.parent() {
         fs::create_dir_all(parent).with_context(|| format!("create {}", parent.display()))?;
@@ -828,15 +834,15 @@ fn install_launch_agent_plist(
         "--state".to_owned(),
         state_path.display().to_string(),
         "--interval".to_owned(),
-        interval.as_secs().to_string(),
+        watch.interval.as_secs().to_string(),
         "--quiet-for".to_owned(),
-        quiet_for.as_secs().to_string(),
+        watch.quiet_for.as_secs().to_string(),
     ];
     for source in sources {
         args.push("--source".to_owned());
         args.push(source.display().to_string());
     }
-    args.extend(filters.cli_args());
+    args.extend(watch.filters.cli_args());
 
     let program_arguments = args
         .iter()

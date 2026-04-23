@@ -447,10 +447,10 @@ fn collect_jsonl_files(
         let path = entry.path();
         if path.is_dir() {
             collect_jsonl_files(&path, filters, files)?;
-        } else if path.extension().and_then(|ext| ext.to_str()) == Some("jsonl") {
-            if path_may_match_since(&path, filters) {
-                files.push(path);
-            }
+        } else if path.extension().and_then(|ext| ext.to_str()) == Some("jsonl")
+            && path_may_match_since(&path, filters)
+        {
+            files.push(path);
         }
     }
 
