@@ -134,6 +134,65 @@ fn search_trace_reports_query_terms_and_fts_query() {
 }
 
 #[test]
+fn search_trace_reports_phrase_mode_and_fts_query() {
+    let store = Store::open(temp_db_path("search-trace-phrase")).unwrap();
+    store.index_session(&sample_session()).unwrap();
+
+    let (trace, results) = store
+        .search_with_trace(SearchOptions {
+            query: "RevenueCat Stripe webhook".to_owned(),
+            limit: 5,
+            repo: None,
+            cwd: None,
+            since: None,
+            from: None,
+            until: None,
+            include_duplicates: false,
+            exclude_sessions: Vec::new(),
+            kinds: vec![EventKind::UserMessage],
+            current_repo: None,
+            mode: SearchMode::Phrase,
+        })
+        .unwrap();
+
+    assert_eq!(trace.match_strategy, MatchStrategy::Phrase);
+    assert_eq!(trace.fts_query, "\"RevenueCat Stripe webhook\"");
+    assert_eq!(results.len(), 1);
+    assert_eq!(results[0].kind, EventKind::UserMessage);
+}
+
+#[test]
+fn search_trace_reports_near_mode_and_fts_query() {
+    let store = Store::open(temp_db_path("search-trace-near")).unwrap();
+    store.index_session(&sample_session()).unwrap();
+
+    let (trace, results) = store
+        .search_with_trace(SearchOptions {
+            query: "RevenueCat bug webhook".to_owned(),
+            limit: 5,
+            repo: None,
+            cwd: None,
+            since: None,
+            from: None,
+            until: None,
+            include_duplicates: false,
+            exclude_sessions: Vec::new(),
+            kinds: vec![EventKind::UserMessage],
+            current_repo: None,
+            mode: SearchMode::Near(4),
+        })
+        .unwrap();
+
+    assert_eq!(trace.match_strategy, MatchStrategy::Near);
+    assert_eq!(
+        trace.fts_query,
+        "NEAR(\"RevenueCat\" \"bug\" \"webhook\", 4)"
+    );
+    assert_eq!(results.len(), 1);
+    assert_eq!(results[0].kind, EventKind::UserMessage);
+}
+
+#[test]
 fn delta_feed_uses_monotonic_change_ids() {
     let store = Store::open(temp_db_path("delta-feed")).unwrap();
     store
@@ -209,6 +268,7 @@ fn keeps_duplicate_session_ids_by_source_file() {
             exclude_sessions: Vec::new(),
             kinds: Vec::new(),
             current_repo: None,
+            mode: SearchMode::AllTerms,
         })
         .unwrap();
     let mut keys = results
@@ -257,6 +317,7 @@ fn ranks_current_repo_sessions_before_other_repos() {
             exclude_sessions: Vec::new(),
             kinds: Vec::new(),
             current_repo: Some("project".to_owned()),
+            mode: SearchMode::AllTerms,
         })
         .unwrap();
 
@@ -309,6 +370,7 @@ fn ranks_current_repo_when_only_a_command_ran_inside_that_repo() {
             exclude_sessions: Vec::new(),
             kinds: Vec::new(),
             current_repo: Some("project".to_owned()),
+            mode: SearchMode::AllTerms,
         })
         .unwrap();
 
@@ -357,6 +419,7 @@ fn filters_search_by_repo_cwd_and_since() {
             exclude_sessions: Vec::new(),
             kinds: Vec::new(),
             current_repo: None,
+            mode: SearchMode::AllTerms,
         })
         .unwrap();
 

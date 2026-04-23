@@ -8,6 +8,9 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ### Fixed
 
+- Added `watch --once --repo <repo> --since <date-or-window>` for bounded one-shot catch-ups, including date-directory pruning so agents can avoid walking large old archives when only recent repo context matters.
+- Added watcher retry/backoff for transient SQLite lock failures and a `using-stale-index` freshness state so agents can tell a refresh failure from an empty result set.
+- Fixed `watch` so a few live writes no longer block indexing an older stable backlog, clarified mixed backlog freshness messages, and added matching `--repo`/`--since` filters to `status` and `doctor`.
 - Accepted `recent --all-repos` as a compatibility alias so agent-generated commands stop failing, and clarified in the docs that `recent` is already cross-repo unless `--repo` is set.
 
 ## [0.1.3] - 2026-04-15

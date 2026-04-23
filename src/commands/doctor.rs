@@ -26,6 +26,13 @@ pub struct DoctorArgs {
     pub quiet_for: u64,
     #[arg(
         long,
+        help = "Only inspect sessions whose session or command cwd matches this repo"
+    )]
+    pub repo: Option<String>,
+    #[arg(long, help = "Only inspect sessions at or after this date/time")]
+    pub since: Option<String>,
+    #[arg(
+        long,
         default_value = DEFAULT_LAUNCH_AGENT_LABEL,
         help = "LaunchAgent label"
     )]
@@ -49,10 +56,12 @@ pub fn run_doctor(args: DoctorArgs) -> Result<()> {
         .unwrap_or(default_launch_agent_path(&args.agent_label)?);
     let db_existed = db_path.exists();
     let sources = resolve_sources(args.sources)?;
+    let filters = crate::indexer::IndexFilters::new(args.repo, args.since)?;
     let status_report = build_status_report(
         db_path.clone(),
         state_path,
         sources.clone(),
+        filters,
         quiet_for,
         args.agent_label,
         agent_path,

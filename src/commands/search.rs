@@ -3,7 +3,9 @@ use crate::commands::exclude::resolve_excluded_sessions;
 use crate::commands::kind::{event_kinds, KindArg};
 use crate::config::default_db_path;
 use crate::output::{compact_whitespace, now_timestamp, preview, shell_quote};
-use crate::store::{source_priority_for_path, SearchOptions, SearchResult, SearchTrace, Store};
+use crate::store::{
+    source_priority_for_path, SearchMode, SearchOptions, SearchResult, SearchTrace, Store,
+};
 use anyhow::{bail, Result};
 use clap::Args;
 use serde_json::json;
@@ -31,6 +33,20 @@ pub struct SearchArgs {
     pub until: Option<String>,
     #[arg(long, help = "Restrict to one local calendar day, YYYY-MM-DD")]
     pub day: Option<String>,
+    #[arg(
+        long,
+        help = "Match the exact token phrase instead of AND-ing terms",
+        conflicts_with = "near"
+    )]
+    pub phrase: bool,
+    #[arg(
+        long,
+        value_name = "DISTANCE",
+        value_parser = clap::value_parser!(u32).range(1..),
+        help = "Match query terms within this FTS NEAR distance",
+        conflicts_with = "phrase"
+    )]
+    pub near: Option<u32>,
     #[arg(
         long = "kind",
         value_enum,
@@ -76,6 +92,20 @@ pub struct BundleArgs {
     #[arg(long, help = "Restrict to one local calendar day, YYYY-MM-DD")]
     pub day: Option<String>,
     #[arg(
+        long,
+        help = "Match the exact token phrase instead of AND-ing terms",
+        conflicts_with = "near"
+    )]
+    pub phrase: bool,
+    #[arg(
+        long,
+        value_name = "DISTANCE",
+        value_parser = clap::value_parser!(u32).range(1..),
+        help = "Match query terms within this FTS NEAR distance",
+        conflicts_with = "phrase"
+    )]
+    pub near: Option<u32>,
+    #[arg(
         long = "kind",
         value_enum,
         value_name = "KIND",
@@ -118,6 +148,7 @@ pub fn run_search(args: SearchArgs) -> Result<()> {
     let (since, from, until) = resolve_date_window(args.since, args.from, args.until, args.day)?;
     let exclude_sessions = resolve_excluded_sessions(args.exclude_sessions, args.exclude_current)?;
     let kinds = event_kinds(&args.kinds);
+    let mode = resolve_search_mode(args.phrase, args.near);
     let current_repo = if args.repo.is_none() && !args.all_repos {
         detect_current_repo()
     } else {
@@ -140,6 +171,7 @@ pub fn run_search(args: SearchArgs) -> Result<()> {
         exclude_sessions,
         kinds,
         current_repo,
+        mode,
     })?;
     if args.json {
         print_search_json(&args.query, &results, &trace, args.trace)?;
@@ -161,6 +193,7 @@ pub fn run_bundle(args: BundleArgs) -> Result<()> {
     let (since, from, until) = resolve_date_window(args.since, args.from, args.until, args.day)?;
     let exclude_sessions = resolve_excluded_sessions(args.exclude_sessions, args.exclude_current)?;
     let kinds = event_kinds(&args.kinds);
+    let mode = resolve_search_mode(args.phrase, args.near);
     let current_repo = if args.repo.is_none() && !args.all_repos {
         detect_current_repo()
     } else {
@@ -178,6 +211,7 @@ pub fn run_bundle(args: BundleArgs) -> Result<()> {
         exclude_sessions: exclude_sessions.clone(),
         kinds: kinds.clone(),
         current_repo,
+        mode,
     })?;
 
     let filters = BundleFilters {
@@ -186,6 +220,8 @@ pub fn run_bundle(args: BundleArgs) -> Result<()> {
         since: &since,
         from: &from,
         until: &until,
+        phrase: args.phrase,
+        near: args.near,
         kinds: &args.kinds,
         include_duplicates: args.include_duplicates,
         exclude_sessions: &exclude_sessions,
@@ -293,6 +329,8 @@ struct BundleFilters<'a> {
     since: &'a Option<String>,
     from: &'a Option<String>,
     until: &'a Option<String>,
+    phrase: bool,
+    near: Option<u32>,
     kinds: &'a [KindArg],
     include_duplicates: bool,
     exclude_sessions: &'a [String],
@@ -391,6 +429,12 @@ fn bundle_filters(filters: BundleFilters<'_>) -> Vec<String> {
     }
     if let Some(until) = filters.until {
         labels.push(format!("until={until}"));
+    }
+    if filters.phrase {
+        labels.push("phrase=true".to_owned());
+    }
+    if let Some(distance) = filters.near {
+        labels.push(format!("near={distance}"));
     }
     for kind in filters.kinds {
         labels.push(format!("kind={}", kind.as_str()));
@@ -533,5 +577,15 @@ fn detect_current_repo() -> Option<String> {
         if !path.pop() {
             return None;
         }
+    }
+}
+
+fn resolve_search_mode(phrase: bool, near: Option<u32>) -> SearchMode {
+    if phrase {
+        SearchMode::Phrase
+    } else if let Some(distance) = near {
+        SearchMode::Near(distance)
+    } else {
+        SearchMode::AllTerms
     }
 }

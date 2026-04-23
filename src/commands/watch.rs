@@ -1,10 +1,15 @@
 use crate::commands::index::resolve_sources;
 use crate::config::{default_db_path, default_state_path, DEFAULT_LAUNCH_AGENT_LABEL};
-use crate::indexer::{index_sources_with_progress, scan_sources_for_pending, SourceScanReport};
+use crate::indexer::{
+    index_sources_with_filters_and_progress,
+    index_stable_pending_sources_with_filters_and_progress, scan_sources_for_pending_with_filters,
+    IndexFilters, SourceScanReport,
+};
 use crate::output::{format_bytes, now_timestamp, progress_line};
 use crate::store::Store;
 use anyhow::{anyhow, Context, Result};
 use clap::Args;
+use rusqlite::{Error as SqliteError, ErrorCode};
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use std::ffi::OsString;
@@ -32,6 +37,13 @@ pub struct WatchArgs {
     pub quiet_for: u64,
     #[arg(long, help = "Run one scan and exit")]
     pub once: bool,
+    #[arg(
+        long,
+        help = "Only index sessions whose session or command cwd matches this repo"
+    )]
+    pub repo: Option<String>,
+    #[arg(long, help = "Only index sessions at or after this date/time")]
+    pub since: Option<String>,
     #[arg(long, help = "Write a macOS LaunchAgent plist for background indexing")]
     pub install_launch_agent: bool,
     #[arg(long, help = "Bootstrap and verify the LaunchAgent after writing it")]
@@ -60,6 +72,13 @@ pub struct StatusArgs {
         help = "Seconds a file must be quiet before indexing"
     )]
     pub quiet_for: u64,
+    #[arg(
+        long,
+        help = "Only inspect sessions whose session or command cwd matches this repo"
+    )]
+    pub repo: Option<String>,
+    #[arg(long, help = "Only inspect sessions at or after this date/time")]
+    pub since: Option<String>,
     #[arg(long, help = "Emit machine-readable JSON")]
     pub json: bool,
     #[arg(
@@ -90,6 +109,7 @@ pub(crate) struct WatchStatusReport {
     pub db_exists: bool,
     pub state_path: PathBuf,
     pub sources: Vec<PathBuf>,
+    pub filters: IndexFilters,
     pub scan: SourceScanReport,
     pub state: WatchState,
     pub last_indexed_at: Option<String>,
@@ -118,6 +138,7 @@ pub fn run_watch(args: WatchArgs) -> Result<()> {
     let sources = resolve_sources(args.sources)?;
     let interval = Duration::from_secs(args.interval);
     let quiet_for = Duration::from_secs(args.quiet_for);
+    let filters = IndexFilters::new(args.repo.clone(), args.since.clone())?;
 
     if args.install_launch_agent {
         if !launch_agent_supported() {
@@ -136,6 +157,7 @@ pub fn run_watch(args: WatchArgs) -> Result<()> {
             &sources,
             interval,
             quiet_for,
+            &filters,
         )?;
         println!("installed launch agent: {}", agent_path.display());
         if args.start_launch_agent {
@@ -150,7 +172,13 @@ pub fn run_watch(args: WatchArgs) -> Result<()> {
     }
 
     loop {
-        match run_watch_iteration(&db_path, &state_path, &sources, quiet_for) {
+        match run_watch_iteration_with_lock_retries(
+            &db_path,
+            &state_path,
+            &sources,
+            quiet_for,
+            &filters,
+        ) {
             Ok(()) => {
                 if args.once {
                     return Ok(());
@@ -171,14 +199,54 @@ pub fn run_watch(args: WatchArgs) -> Result<()> {
     }
 }
 
+fn run_watch_iteration_with_lock_retries(
+    db_path: &Path,
+    state_path: &Path,
+    sources: &[PathBuf],
+    quiet_for: Duration,
+    filters: &IndexFilters,
+) -> Result<()> {
+    let retry_delays = lock_retry_delays();
+    let total_attempts = retry_delays.len() + 1;
+
+    for attempt in 0..total_attempts {
+        match run_watch_iteration(db_path, state_path, sources, quiet_for, filters) {
+            Ok(()) => return Ok(()),
+            Err(error) if is_database_lock_error(&error) => {
+                if attempt == retry_delays.len() {
+                    return use_stale_index_after_lock(
+                        db_path,
+                        state_path,
+                        sources,
+                        quiet_for,
+                        filters,
+                        &error,
+                        total_attempts,
+                    );
+                }
+                let delay = retry_delays[attempt];
+                eprintln!(
+                    "watch refresh blocked by database lock; retrying in {} ms",
+                    delay.as_millis()
+                );
+                thread::sleep(delay);
+            }
+            Err(error) => return Err(error),
+        }
+    }
+
+    Ok(())
+}
+
 fn run_watch_iteration(
     db_path: &Path,
     state_path: &Path,
     sources: &[PathBuf],
     quiet_for: Duration,
+    filters: &IndexFilters,
 ) -> Result<()> {
     let mut state = read_watch_state(state_path).unwrap_or_default();
-    let (scan, last_indexed_at) = scan_status(db_path, sources, quiet_for)?;
+    let (scan, last_indexed_at) = scan_status(db_path, sources, quiet_for, filters)?;
     state.last_run_at = Some(now_timestamp());
     state.pending_files = scan.pending_files;
     state.last_error = None;
@@ -190,7 +258,7 @@ fn run_watch_iteration(
         return Ok(());
     }
 
-    if scan.waiting_files > 0 {
+    if scan.stable_pending_files == 0 {
         state.last_indexed_at = last_indexed_at.or(state.last_indexed_at);
         write_watch_state(state_path, &state)?;
         println!(
@@ -202,10 +270,21 @@ fn run_watch_iteration(
 
     let store = Store::open(db_path)?;
     let started = Instant::now();
-    let report = index_sources_with_progress(&store, sources, |report| {
-        eprintln!("{}", progress_line(report, started.elapsed()));
-    })?;
-    let remaining = scan_sources_for_pending(Some(&store), sources, quiet_for)?;
+    let report = if scan.waiting_files > 0 {
+        index_stable_pending_sources_with_filters_and_progress(
+            &store,
+            sources,
+            quiet_for,
+            filters,
+            |report| eprintln!("{}", progress_line(report, started.elapsed())),
+        )?
+    } else {
+        index_sources_with_filters_and_progress(&store, sources, filters, |report| {
+            eprintln!("{}", progress_line(report, started.elapsed()));
+        })?
+    };
+    let remaining =
+        scan_sources_for_pending_with_filters(Some(&store), sources, quiet_for, filters)?;
 
     state.last_run_at = Some(now_timestamp());
     state.last_indexed_at = store
@@ -219,14 +298,58 @@ fn run_watch_iteration(
     state.last_error = None;
     write_watch_state(state_path, &state)?;
 
+    let remaining_message = if remaining.waiting_files > 0 {
+        format!(
+            "{} pending files remain ({} still within quiet window)",
+            remaining.pending_files, remaining.waiting_files
+        )
+    } else {
+        format!("{} pending files remain", remaining.pending_files)
+    };
     println!(
-        "watch indexed {} session files, {} events from {}/{} files; {} pending files remain",
+        "watch indexed {} session files, {} events from {}/{} files; {}",
         report.sessions_indexed,
         report.events_indexed,
         report.files_seen,
         report.files_total,
-        remaining.pending_files
+        remaining_message
     );
+    Ok(())
+}
+
+fn use_stale_index_after_lock(
+    db_path: &Path,
+    state_path: &Path,
+    sources: &[PathBuf],
+    quiet_for: Duration,
+    filters: &IndexFilters,
+    error: &anyhow::Error,
+    attempts: usize,
+) -> Result<()> {
+    let mut state = read_watch_state(state_path).unwrap_or_default();
+    let (scan, last_indexed_at) =
+        scan_status(db_path, sources, quiet_for, filters).unwrap_or_else(|_| {
+            (
+                scan_sources_for_pending_with_filters(None, sources, quiet_for, filters)
+                    .unwrap_or_else(|_| SourceScanReport {
+                        files_total: 0,
+                        pending_files: state.pending_files,
+                        pending_bytes: 0,
+                        stable_pending_files: 0,
+                        waiting_files: 0,
+                        missing_sources: Vec::new(),
+                    }),
+                state.last_indexed_at.clone(),
+            )
+        });
+    let message = stale_index_lock_message(error, attempts);
+    state.last_run_at = Some(now_timestamp());
+    state.last_indexed_at = last_indexed_at.or(state.last_indexed_at);
+    state.pending_files = scan.pending_files;
+    state.last_error = Some(message.clone());
+    write_watch_state(state_path, &state)?;
+
+    println!("watch using stale index: {message}");
     Ok(())
 }
 
@@ -235,6 +358,7 @@ pub fn run_status(args: StatusArgs) -> Result<()> {
     let state_path = args.state.unwrap_or(default_state_path()?);
     let sources = resolve_sources(args.sources)?;
     let quiet_for = Duration::from_secs(args.quiet_for);
+    let filters = IndexFilters::new(args.repo, args.since)?;
     let agent_path = args
         .agent_path
         .unwrap_or(default_launch_agent_path(&args.agent_label)?);
@@ -242,6 +366,7 @@ pub fn run_status(args: StatusArgs) -> Result<()> {
         db_path,
         state_path,
         sources,
+        filters,
         quiet_for,
         args.agent_label,
         agent_path,
@@ -259,6 +384,9 @@ pub fn run_status(args: StatusArgs) -> Result<()> {
     };
     println!("database: {} ({db_status})", report.db_path.display());
     println!("state: {}", report.state_path.display());
+    if let Some(filters) = format_filters(&report.filters) {
+        println!("filters: {filters}");
+    }
     println!(
         "freshness: {} ({})",
         report.freshness.state, report.freshness.message
@@ -314,12 +442,13 @@ pub(crate) fn build_status_report(
     db_path: PathBuf,
     state_path: PathBuf,
     sources: Vec<PathBuf>,
+    filters: IndexFilters,
     quiet_for: Duration,
     agent_label: String,
     agent_path: PathBuf,
 ) -> Result<WatchStatusReport> {
     let state = read_watch_state(&state_path).unwrap_or_default();
-    let (scan, last_indexed_at) = scan_status(&db_path, &sources, quiet_for)?;
+    let (scan, last_indexed_at) = scan_status(&db_path, &sources, quiet_for, &filters)?;
     let last_indexed_at = last_indexed_at.or(state.last_indexed_at.clone());
     let db_exists = db_path.exists();
     let launch_agent = launch_agent_status(agent_label, agent_path);
@@ -330,6 +459,7 @@ pub(crate) fn build_status_report(
         db_exists,
         state_path,
         sources,
+        filters,
         scan,
         state,
         last_indexed_at,
@@ -344,6 +474,10 @@ pub(crate) fn status_json(report: &WatchStatusReport) -> Value {
         "db_exists": report.db_exists,
         "state_path": report.state_path,
         "sources": report.sources,
+        "filters": {
+            "repo": report.filters.repo(),
+            "since": report.filters.since_value(),
+        },
         "files_total": report.scan.files_total,
         "pending_files": report.scan.pending_files,
         "pending_bytes": report.scan.pending_bytes,
@@ -373,6 +507,14 @@ fn freshness_verdict(
     state: &WatchState,
 ) -> FreshnessVerdict {
     if let Some(error) = &state.last_error {
+        if is_database_lock_text(error) {
+            return FreshnessVerdict {
+                state: "using-stale-index",
+                message: format!(
+                    "refresh failed because database is locked; using stale index: {error}"
+                ),
+            };
+        }
         return FreshnessVerdict {
             state: "stale",
             message: format!("watcher last failed: {error}"),
@@ -382,20 +524,21 @@ fn freshness_verdict(
     if scan.pending_files > 0 && state.last_run_at.is_none() {
         return FreshnessVerdict {
             state: "watcher-not-running",
-            message: format!(
-                "{} pending stable files and no watcher state",
-                scan.stable_pending_files
-            ),
+            message: format!("watcher has no state; {}", pending_backlog_message(scan)),
         };
     }
 
-    if scan.stable_pending_files > 0 || (!db_exists && scan.pending_files > 0) {
+    if scan.stable_pending_files > 0 {
         return FreshnessVerdict {
             state: "stale",
-            message: format!(
-                "{} stable files are ready to index",
-                scan.stable_pending_files
-            ),
+            message: pending_backlog_message(scan),
+        };
+    }
+
+    if !db_exists && scan.pending_files > 0 {
+        return FreshnessVerdict {
+            state: "stale",
+            message: format!("database is missing; {}", pending_backlog_message(scan)),
         };
     }
 
@@ -423,6 +566,76 @@ fn freshness_verdict(
         state: "fresh",
         message: "index is current".to_owned(),
     }
+}
+
+fn pending_backlog_message(scan: &SourceScanReport) -> String {
+    match (scan.stable_pending_files, scan.waiting_files) {
+        (stable, waiting) if stable > 0 && waiting > 0 => format!(
+            "{stable} stable files are ready to index; {waiting} files are still within the quiet window"
+        ),
+        (stable, _) if stable > 0 => format!("{stable} stable files are ready to index"),
+        (_, waiting) if waiting > 0 => {
+            format!("{waiting} files are still within the quiet window")
+        }
+        _ => "index is current".to_owned(),
+    }
+}
+
+fn format_filters(filters: &IndexFilters) -> Option<String> {
+    let mut parts = Vec::new();
+    if let Some(repo) = filters.repo() {
+        parts.push(format!("repo={repo}"));
+    }
+    if let Some(since) = filters.since_value() {
+        parts.push(format!("since={since}"));
+    }
+    if parts.is_empty() {
+        None
+    } else {
+        Some(parts.join(", "))
+    }
+}
+
+fn stale_index_lock_message(error: &anyhow::Error, attempts: usize) -> String {
+    format!("database is locked; using stale index after {attempts} refresh attempts: {error:#}")
+}
+
+fn lock_retry_delays() -> Vec<Duration> {
+    let retries = std::env::var("CODEX_RECALL_WATCH_LOCK_RETRIES")
+        .ok()
+        .and_then(|value| value.parse::<usize>().ok())
+        .unwrap_or(2);
+    let base_ms = std::env::var("CODEX_RECALL_WATCH_LOCK_RETRY_MS")
+        .ok()
+        .and_then(|value| value.parse::<u64>().ok())
+        .unwrap_or(250);
+
+    (0..retries)
+        .map(|attempt| {
+            let multiplier = 1_u64.checked_shl(attempt.min(16) as u32).unwrap_or(1);
+            Duration::from_millis(base_ms.saturating_mul(multiplier))
+        })
+        .collect()
+}
+
+fn is_database_lock_error(error: &anyhow::Error) -> bool {
+    error.chain().any(|cause| {
+        if let Some(sqlite_error) = cause.downcast_ref::<SqliteError>() {
+            return matches!(
+                sqlite_error,
+                SqliteError::SqliteFailure(db_error, _)
+                    if matches!(db_error.code, ErrorCode::DatabaseBusy | ErrorCode::DatabaseLocked)
+            );
+        }
+        is_database_lock_text(&cause.to_string())
+    })
+}
+
+fn is_database_lock_text(value: &str) -> bool {
+    let lower = value.to_ascii_lowercase();
+    lower.contains("database is locked")
+        || lower.contains("database table is locked")
+        || lower.contains("database is busy")
 }
 
 fn launch_agent_status(label: String, path: PathBuf) -> LaunchAgentStatus {
@@ -545,14 +758,18 @@ fn scan_status(
     db_path: &Path,
     sources: &[PathBuf],
     quiet_for: Duration,
+    filters: &IndexFilters,
 ) -> Result<(SourceScanReport, Option<String>)> {
     if !db_path.exists() {
-        return Ok((scan_sources_for_pending(None, sources, quiet_for)?, None));
+        return Ok((
+            scan_sources_for_pending_with_filters(None, sources, quiet_for, filters)?,
+            None,
+        ));
     }
 
     let store = Store::open_readonly(db_path)?;
     let last_indexed_at = store.last_indexed_at()?;
-    let scan = scan_sources_for_pending(Some(&store), sources, quiet_for)?;
+    let scan = scan_sources_for_pending_with_filters(Some(&store), sources, quiet_for, filters)?;
     Ok((scan, last_indexed_at))
 }
 
@@ -594,6 +811,7 @@ fn install_launch_agent_plist(
     sources: &[PathBuf],
     interval: Duration,
     quiet_for: Duration,
+    filters: &IndexFilters,
 ) -> Result<()> {
     if let Some(parent) = path.parent() {
         fs::create_dir_all(parent).with_context(|| format!("create {}", parent.display()))?;
@@ -618,6 +836,7 @@ fn install_launch_agent_plist(
         args.push("--source".to_owned());
         args.push(source.display().to_string());
     }
+    args.extend(filters.cli_args());
 
     let program_arguments = args
         .iter()
